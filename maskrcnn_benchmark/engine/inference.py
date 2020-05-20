@@ -65,7 +65,7 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
             images, targets, image_ids = batch
 
             images_list = deepcopy(images)
-            images_list = to_image_list(images_list, cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
+            #images_list = to_image_list(images_list, cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
 
             transform = transforms.Compose([
                 transforms.ToPILImage(),
@@ -87,7 +87,12 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
             else:
                 output=[]
                 # relation detection needs the targets
-                sgs = model.forward(images_list.to(device), targets, ret_sg=True)
+                sgs=[]
+                for i in range(len(images_list)):
+                    model_input = to_image_list(images_list[i], cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
+                    sg = model.forward(model_input, [targets[i]], ret_sg=True)
+                    sgs.append(sg)
+                
                 sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
 
                 listener_loss = None
@@ -279,6 +284,7 @@ def listener_inference(
     )
 
     loss_sum = sum(predictions)
-    loss_mean = loss_sum / len(predictions)
+    #TODO: Subtract (batch_size / num_gpu) from denominator 
+    loss_mean = loss_sum / (len(predictions) - 3)
     return loss_mean
 

@@ -8,6 +8,7 @@ build/
 dist/
 
 core.*
+*.txt
 # ipython/jupyter notebooks
 #*.ipynb
 **/.ipynb_checkpoints/

@@ -24,7 +24,7 @@ from maskrcnn_benchmark.solver import make_optimizer, make_listener_optimizer
 from maskrcnn_benchmark.engine.trainer import reduce_loss_dict
 from maskrcnn_benchmark.engine.inference import listener_inference
 from maskrcnn_benchmark.modeling.detector import build_detection_model
-from maskrcnn_benchmark.utils.checkpoint import DetectronCheckpointer
+from maskrcnn_benchmark.utils.checkpoint import DetectronCheckpointer, Checkpointer
 from maskrcnn_benchmark.utils.checkpoint import clip_grad_norm
 from maskrcnn_benchmark.utils.collect_env import collect_env_info
 from maskrcnn_benchmark.utils.comm import synchronize, get_rank, all_gather
@@ -82,6 +82,7 @@ def train(cfg, local_rank, distributed, logger):
     optimizer = make_optimizer(cfg, model, logger, slow_heads=slow_heads, slow_ratio=10.0, rl_factor=float(num_batch))
     listener_optimizer = make_listener_optimizer(cfg, listener)
     scheduler = make_lr_scheduler(cfg, optimizer, logger)
+    listener_scheduler = None
     debug_print(logger, 'end optimizer and shcedule')
     # Initialize mixed-precision training
     use_mixed_precision = cfg.DTYPE == "float16"
@@ -101,23 +102,21 @@ def train(cfg, local_rank, distributed, logger):
     arguments["iteration"] = 0
 
     output_dir = cfg.OUTPUT_DIR
+    listener_dir = cfg.LISTENER_DIR
 
+    print('LISTENER DIR: ', listener_dir)
+    
     save_to_disk = get_rank() == 0
     checkpointer = DetectronCheckpointer(
         cfg, model, optimizer, scheduler, output_dir, save_to_disk, custom_scheduler=True
     )
     listener_checkpointer = Checkpointer(
-        cfg, listener, listener_optimizer, None, listener_dir, save_to_disk, custom_scheduler=False
+        listener, listener_optimizer, listener_scheduler, listener_dir, save_to_disk, custom_scheduler=False
     )
     # if there is certain checkpoint in output_dir, load it, else load pretrained detector
     if listener_checkpointer.has_checkpoint():
-        extra_listener_checkpoint_data = listener_checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
-                                       update_schedule=cfg.SOLVER.UPDATE_SCHEDULE_DURING_LOAD)
+        extra_listener_checkpoint_data = listener_checkpointer.load('')
         arguments.update(extra_checkpoint_data)
-    else:
-        # load_mapping is only used when we init current model from detection model.
-        checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, with_optim=False, load_mapping=load_mapping)
-
 
     if checkpointer.has_checkpoint():
         extra_checkpoint_data = checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
@@ -145,8 +144,8 @@ def train(cfg, local_rank, distributed, logger):
 
     if cfg.SOLVER.PRE_VAL:
         logger.info("Validate before training")
-        run_val(cfg, model, listener, val_data_loaders, distributed, logger)
-
+        loss_val =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+        print('loss val: ', loss_val)
     logger.info("Start training")
     meters = MetricLogger(delimiter="  ")
     max_iter = len(train_data_loader)
@@ -317,7 +316,9 @@ def run_val(cfg, model, listener, val_data_loaders, distributed, logger):
         synchronize()
         val_result.append(dataset_result)
     # support for multi gpu distributed testing
-    gathered_result = all_gather(torch.tensor(dataset_result).cpu())
+    print('VAL_RESULT: ', val_result)
+    gathered_result = all_gather(torch.tensor(val_result).cpu())
+    print('GATHERED_RESULT: ', gathered_result)
     gathered_result = [t.view(-1) for t in gathered_result]
     gathered_result = torch.cat(gathered_result, dim=-1).view(-1)
     valid_result = gathered_result[gathered_result>=0]
@@ -390,8 +391,7 @@ def main():
 
     args = parser.parse_args()
 
-    #num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
-    num_gpus = 3
+    num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     args.distributed = num_gpus > 1
 
     if args.distributed:
@@ -434,9 +434,9 @@ def main():
 
 
     listener_config_path = os.path.join(cfg.LISTENER_DIR, 'config.yml')
-    logger.info("Saving config into: {}".format(output_config_path))
+    logger.info("Saving config into: {}".format(listener_config_path))
     # save overloaded model config in the output directory
-    save_config(cfg, output_config_path)
+    save_config(cfg, listener_config_path)
 
     listener = train(cfg, args.local_rank, args.distributed, logger)
 
