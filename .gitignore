@@ -6,9 +6,10 @@ _ext
 maskrcnn_benchmark.egg-info/
 build/
 dist/
-
+wandb/
 core.*
 *.txt
+log*
 # ipython/jupyter notebooks
 #*.ipynb
 **/.ipynb_checkpoints/
