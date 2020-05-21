@@ -284,7 +284,6 @@ def listener_inference(
     )
 
     loss_sum = sum(predictions)
-    #TODO: Subtract (batch_size / num_gpu) from denominator 
-    loss_mean = loss_sum / (len(predictions) - 3)
+    loss_mean = loss_sum / (len(predictions) - (cfg.TEST.IMS_PER_BATCH/cfg.NUM_GPUS))
     return loss_mean
 

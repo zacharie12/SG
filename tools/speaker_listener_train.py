@@ -11,7 +11,7 @@ import argparse
 import os
 import time
 import datetime
-
+from pytorch_memlab import profile
 import torch
 from torch.nn.utils import clip_grad_norm_
 import torchvision
@@ -27,7 +27,7 @@ from maskrcnn_benchmark.modeling.detector import build_detection_model
 from maskrcnn_benchmark.utils.checkpoint import DetectronCheckpointer, Checkpointer
 from maskrcnn_benchmark.utils.checkpoint import clip_grad_norm
 from maskrcnn_benchmark.utils.collect_env import collect_env_info
-from maskrcnn_benchmark.utils.comm import synchronize, get_rank, all_gather
+from maskrcnn_benchmark.utils.comm import synchronize, get_rank, all_gather, is_main_process
 from maskrcnn_benchmark.utils.imports import import_file
 from maskrcnn_benchmark.utils.logger import setup_logger, debug_print
 from maskrcnn_benchmark.utils.miscellaneous import mkdir, save_config
@@ -40,16 +40,23 @@ from maskrcnn_benchmark.listener.listener import build_listener
 from maskrcnn_benchmark.listener.utils import format_scores, collate_sgs
 # See if we can use apex.DistributedDataParallel instead of the torch default,
 # and enable mixed-precision via apex.amp
+import wandb
+
 try:
     from apex import amp
 except ImportError:
     raise ImportError('Use APEX for multi-precision via apex.amp')
 
-
+@profile
 def train(cfg, local_rank, distributed, logger):
+    if is_main_process():
+        wandb.init(project="sgg-lol")
     debug_print(logger, 'prepare training')
     model = build_detection_model(cfg)
     listener = build_listener(cfg)
+    if is_main_process():
+        wandb.watch(listener)
+        
 
     debug_print(logger, 'end model construction')
 
@@ -102,10 +109,7 @@ def train(cfg, local_rank, distributed, logger):
     arguments["iteration"] = 0
 
     output_dir = cfg.OUTPUT_DIR
-    listener_dir = cfg.LISTENER_DIR
-
-    print('LISTENER DIR: ', listener_dir)
-    
+    listener_dir = cfg.LISTENER_DIR 
     save_to_disk = get_rank() == 0
     checkpointer = DetectronCheckpointer(
         cfg, model, optimizer, scheduler, output_dir, save_to_disk, custom_scheduler=True
@@ -144,8 +148,8 @@ def train(cfg, local_rank, distributed, logger):
 
     if cfg.SOLVER.PRE_VAL:
         logger.info("Validate before training")
-        loss_val =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
-        print('loss val: ', loss_val)
+        #loss_val =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+
     logger.info("Start training")
     meters = MetricLogger(delimiter="  ")
     max_iter = len(train_data_loader)
@@ -204,7 +208,7 @@ def train(cfg, local_rank, distributed, logger):
         num_sgs = true_index + 1
         listener_loss /= num_sgs
         listener_loss *= cfg.LISTENER.LOSS_COEF
-
+        
         listener_loss = listener_loss.to(device)
         print('LISTENER_LOSS: ', listener_loss)
         loss_dict = {
@@ -216,6 +220,8 @@ def train(cfg, local_rank, distributed, logger):
         # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = reduce_loss_dict(loss_dict)
         losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+        if is_main_process():
+            wandb.log({"Train Loss": losses_reduced})
         meters.update(loss=losses_reduced, **loss_dict_reduced)
 
         listener_optimizer.zero_grad()
@@ -264,6 +270,8 @@ def train(cfg, local_rank, distributed, logger):
         if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
             logger.info("Start validating")
             val_result = run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+            if is_main_process():
+                wandb.log({"Validation Loss": val_result})
             logger.info("Validation Result: %.4f" % val_result)
  
 
@@ -318,7 +326,6 @@ def run_val(cfg, model, listener, val_data_loaders, distributed, logger):
     # support for multi gpu distributed testing
     print('VAL_RESULT: ', val_result)
     gathered_result = all_gather(torch.tensor(val_result).cpu())
-    print('GATHERED_RESULT: ', gathered_result)
     gathered_result = [t.view(-1) for t in gathered_result]
     gathered_result = torch.cat(gathered_result, dim=-1).view(-1)
     valid_result = gathered_result[gathered_result>=0]
@@ -390,8 +397,9 @@ def main():
     )
 
     args = parser.parse_args()
-
+    
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
+    cfg.NUM_GPUS = num_gpus
     args.distributed = num_gpus > 1
 
     if args.distributed:
