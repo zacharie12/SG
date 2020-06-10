@@ -12,6 +12,8 @@ class Listener(nn.Module):
         self.cnn = cnn_t
         self.listener_end = listener_end_t
     
+        self.apply(init_model)
+
     def forward(self, sg, image):
         g_feature = self.gnn(sg)
         im_feature = self.cnn(image)
@@ -22,6 +24,12 @@ class Listener(nn.Module):
 
         feature = torch.cat((g_feature, im_feature), dim=1)
         return self.listener_end(feature)
+
+
+def init_model(m):
+    if type(m) == nn.Conv2d or type(m) == nn.Linear:
+        nn.init.xavier_uniform_(m.weight)
+
 
 def build_listener(cfg):
     listener = Listener(build_gnn(cfg), build_cnn(cfg), build_end(cfg))

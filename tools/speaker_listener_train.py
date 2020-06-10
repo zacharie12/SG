@@ -16,7 +16,7 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 import torchvision
 from torchvision import transforms
-
+import torch.distributed as dist
 from maskrcnn_benchmark.config import cfg
 from maskrcnn_benchmark.data import make_data_loader
 from maskrcnn_benchmark.solver import make_lr_scheduler
@@ -25,7 +25,7 @@ from maskrcnn_benchmark.engine.trainer import reduce_loss_dict
 from maskrcnn_benchmark.engine.inference import listener_inference
 from maskrcnn_benchmark.modeling.detector import build_detection_model
 from maskrcnn_benchmark.utils.checkpoint import DetectronCheckpointer, Checkpointer
-from maskrcnn_benchmark.utils.checkpoint import clip_grad_norm
+from maskrcnn_benchmark.utils.checkpoint import clip_grad_norm, clip_grad_value
 from maskrcnn_benchmark.utils.collect_env import collect_env_info
 from maskrcnn_benchmark.utils.comm import synchronize, get_rank, all_gather, is_main_process
 from maskrcnn_benchmark.utils.imports import import_file
@@ -50,7 +50,7 @@ except ImportError:
 @profile
 def train(cfg, local_rank, distributed, logger):
     if is_main_process():
-        wandb.init(project="sgg-lol")
+        wandb.init(project='scene-graph', entity='sgg-speaker-listener')
     debug_print(logger, 'prepare training')
     model = build_detection_model(cfg)
     listener = build_listener(cfg)
@@ -94,8 +94,10 @@ def train(cfg, local_rank, distributed, logger):
     # Initialize mixed-precision training
     use_mixed_precision = cfg.DTYPE == "float16"
     amp_opt_level = 'O1' if use_mixed_precision else 'O0'
+    listener, listener_optimizer = amp.initialize(listener, listener_optimizer, opt_level='O0')
     model, optimizer = amp.initialize(model, optimizer, opt_level=amp_opt_level)
-    listener, listener_optimizer = amp.initialize(listener, listener_optimizer, opt_level=amp_opt_level)
+
+    listener.float()
 
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -104,6 +106,13 @@ def train(cfg, local_rank, distributed, logger):
             broadcast_buffers=False,
             find_unused_parameters=True,
         )
+
+        listener = torch.nn.parallel.DistributedDataParallel(
+            listener, device_ids=[local_rank], output_device=local_rank,
+            # this should be removed if we update BatchNorm stats
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        ) 
     debug_print(logger, 'end distributed')
     arguments = {}
     arguments["iteration"] = 0
@@ -120,7 +129,7 @@ def train(cfg, local_rank, distributed, logger):
     # if there is certain checkpoint in output_dir, load it, else load pretrained detector
     if listener_checkpointer.has_checkpoint():
         extra_listener_checkpoint_data = listener_checkpointer.load('')
-        arguments.update(extra_checkpoint_data)
+        arguments.update(extra_listener_checkpoint_data)
 
     if checkpointer.has_checkpoint():
         extra_checkpoint_data = checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
@@ -159,7 +168,7 @@ def train(cfg, local_rank, distributed, logger):
 
     print_first_grad = True
 
-    listener_loss_func = torch.nn.MarginRankingLoss()
+    listener_loss_func = torch.nn.MarginRankingLoss(margin=1, reduction='none')
 
     for iteration, (images, targets, _) in enumerate(train_data_loader, start_iter):
         print(f'ITERATION NUMBER: {iteration}')
@@ -179,6 +188,8 @@ def train(cfg, local_rank, distributed, logger):
             transforms.ToPILImage(),
             transforms.Resize((cfg.LISTENER.IMAGE_SIZE, cfg.LISTENER.IMAGE_SIZE)),
             transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+
             # add normalize if we use vgg or resnet
         ])
         # turn images to a uniform size
@@ -197,17 +208,54 @@ def train(cfg, local_rank, distributed, logger):
         sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
 
         listener_loss = None
+        avg_acc = 0
         for true_index, sg in enumerate(sgs):
+            acc = 0
             detached_sg = (sg[0].detach().requires_grad_(), sg[1], sg[2].detach().requires_grad_() )
             #scores = listener(sg, images)
             scores = listener(detached_sg, images)
+            print('SCORES: ', scores)
+            (predicted_scores, true_scores, _) = format_scores(scores, true_index, device)
+            predicted_scores = predicted_scores.t()
+            true_scores = true_scores.t()
+            for i in range(len(predicted_scores)):
+                if predicted_scores[i] < true_scores[i]:
+                    acc += 1
+            
+            acc  = 100*acc / (len(predicted_scores) - 1)
+
+            (true_tensor, scores, binary) = format_scores(scores, true_index, device)
+
             if listener_loss is None:
-                listener_loss = listener_loss_func(*format_scores(scores, true_index, device))
-            listener_loss += listener_loss_func(*format_scores(scores, true_index, device))
+                listener_loss = torch.max(listener_loss_func(true_tensor, scores, binary))
+            else:
+                listener_loss = listener_loss + torch.max(listener_loss_func(true_tensor, scores, binary))
+
+
+            # add a loss term that aims at maximizing the gap between scores, so the model
+            # won't get stuck in a local minima where every pair gets the same score
+            gap_reward = -torch.sum(torch.abs(scores - true_tensor)) * cfg.LISTENER.GAP_COEF / (len(predicted_scores) - 1)
+
+
+
+            avg_acc += acc
+
+        avg_acc /= len(sgs)
+
+        avg_acc = torch.tensor([avg_acc]).to(device)
+        # reduce acc over all gpus
+        avg_acc = {'acc' : avg_acc}
+        avg_acc_reduced = reduce_loss_dict(avg_acc)
+        avg_acc_reduced = sum(acc for acc in avg_acc_reduced.values())
+        # log acc to wadb
+        if is_main_process():
+            wandb.log({"Train Accuracy": avg_acc_reduced.item()})
 
         num_sgs = true_index + 1
         listener_loss /= num_sgs
+        gap_reward /= num_sgs
         listener_loss *= cfg.LISTENER.LOSS_COEF
+        listener_loss += gap_reward
         
         listener_loss = listener_loss.to(device)
         print('LISTENER_LOSS: ', listener_loss)
@@ -232,7 +280,7 @@ def train(cfg, local_rank, distributed, logger):
         
         verbose = (iteration % cfg.SOLVER.PRINT_GRAD_FREQ) == 0 or print_first_grad # print grad or not
         print_first_grad = False
-
+        clip_grad_value([(n, p) for n, p in listener.named_parameters() if p.requires_grad], cfg.LISTENER.CLIP_VALUE, logger=logger, verbose=True, clip=True)
         listener_optimizer.step()
 
         batch_time = time.time() - end

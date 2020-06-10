@@ -2,7 +2,7 @@ from abc import ABC
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import CGConv
+from torch_geometric.nn import CGConv, GMMConv, GlobalAttention, global_mean_pool
 from math import sqrt
 
 
@@ -19,22 +19,68 @@ class SimpleGNN(Gnn):
         super(SimpleGNN, self).__init__()
         self.conv1 = CGConv(in_channels, dim, aggr='add', bias=True)
         self.conv2 = CGConv(in_channels, dim,  aggr='add', bias=True)
-        std_dev = float(1/sqrt(in_channels))
-        self.node_w = nn.Linear(in_channels, out_size, bias=False)
-        self.node_bias = nn.Parameter(torch.FloatTensor(out_size).uniform_(-std_dev, std_dev))
+        self.pooling = GlobalAttention(
+            nn.Sequential(
+                nn.Linear(in_channels, 1)
+            ),
+            nn.Sequential(
+                nn.Linear(in_channels, in_channels)
+            )
+        )
 
     def forward(self, sg):
         x, edge_idx, edge_w = sg
+        x = x.float()
+        edge_w = edge_w.float()
+        N = len(x)
         x = self.conv1(x, edge_idx, edge_w)
         x = F.relu(x)
         x = F.dropout(x, training=self.training)
         x = self.conv2(x, edge_idx, edge_w)
-        x = self.node_w(x)
-        x = torch.sum(x, keepdim=True, dim=0)
-        x += self.node_bias
+        device = x.get_device()
+        batch = torch.zeros((N), dtype=torch.long, device=device)
+        x = self.pooling(x, batch)
         return x
 
-GNN_ARCHITECHTURE = {'SimpleGNN':SimpleGNN }
+class GaussGNN(Gnn):
+    def __init__(self, in_channels, dim, out_size):
+        super(GaussGNN, self).__init__()
+        self.conv1 = GMMConv(in_channels, in_channels,  dim, kernel_size=25)
+        self.conv2 = GMMConv(in_channels, in_channels,  dim, kernel_size=25)
+        self.conv3 = GMMConv(in_channels, in_channels,  dim, kernel_size=25)
+        self.linear = nn.Linear(in_channels, in_channels)
+        '''
+        self.pooling = GlobalAttention(
+            nn.Sequential(
+                nn.Linear(in_channels, 1),
+            ),
+            nn.Sequential(
+                nn.Linear(in_channels, in_channels)
+            )
+        )
+        '''
+
+    def forward(self, sg):
+        x, edge_idx, edge_w = sg
+        # x = x.float()
+        # edge_w = edge_w.float()
+        N = len(x)
+        x = self.conv1(x, edge_idx, edge_w)
+        x = F.relu(x)
+        #x = F.dropout(x, training=self.training)
+        x = self.conv2(x, edge_idx, edge_w)
+        x = F.relu(x)
+        #x = F.dropout(x, training=self.training)
+        x = self.conv3(x, edge_idx, edge_w)
+        x = self.linear(x)
+        
+        device = x.get_device()
+        batch = torch.zeros((N), dtype=torch.long, device=device)
+        x = global_mean_pool(x, batch)
+        return x
+
+
+GNN_ARCHITECHTURE = {'SimpleGNN':SimpleGNN, 'GaussGNN':GaussGNN }
 def build_gnn(cfg):
     gnn = GNN_ARCHITECHTURE[cfg.LISTENER.GNN](cfg.LISTENER.NODE_SIZE, cfg.LISTENER.EDGE_SIZE, cfg.LISTENER.GNN_OUTPUT)
     return gnn

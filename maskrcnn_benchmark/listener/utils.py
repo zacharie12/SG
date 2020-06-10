@@ -1,12 +1,11 @@
 import torch
 
 def format_scores(scores, true_index, device):
-    true_score = scores[true_index]
     score_length = scores.size(0)
-    true_tensor = torch.full((score_length,), true_score.item()).to(device)
+    true_tensor = scores[true_index].repeat(score_length)
     binary = torch.ones(score_length).to(device)
 
-    return true_tensor, scores, binary
+    return true_tensor.t(), scores.t(), binary
         
 
 def collate_sgs(sgs, device):

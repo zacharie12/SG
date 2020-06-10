@@ -145,6 +145,29 @@ class DetectronCheckpointer(Checkpointer):
             loaded = dict(model=loaded)
         return loaded
 
+def clip_grad_value(named_parameters, max_value, logger, clip=True, verbose=False):
+    # for logging
+    total_norm = 0
+    param_to_norm = {}
+    param_to_shape = {}
+    for n, p in named_parameters:
+        if p.grad is not None:
+            param_norm = p.grad.norm(2)
+            total_norm += param_norm ** 2
+            param_to_norm[n] = param_norm
+            param_to_shape[n] = p.size()
+
+
+    max_value = float(max_value)
+    for n, p in named_parameters:
+        if p.grad is not None:
+            p.grad.data.clamp_(min=-max_value, max=max_value)
+    
+    if verbose:
+        logger.info('---Total norm {:.5f}-----------------'.format(total_norm))
+        for name, norm in sorted(param_to_norm.items(), key=lambda x: -x[1]):
+            logger.info("{:<50s}: {:.5f}, ({})".format(name, norm, param_to_shape[name]))
+        logger.info('-------------------------------')
 
 def clip_grad_norm(named_parameters, max_norm, logger, clip=False, verbose=False):
     """Clips gradient norm of an iterable of parameters.
@@ -177,7 +200,8 @@ def clip_grad_norm(named_parameters, max_norm, logger, clip=False, verbose=False
     if clip_coef < 1 and clip:
         for _, p in named_parameters:
             if p.grad is not None:
-                p.grad.mul_(clip_coef)
+                #p.grad.mul_(clip_coef)
+                pass
 
     if verbose:
         logger.info('---Total norm {:.5f} clip coef {:.5f}-----------------'.format(total_norm, clip_coef))

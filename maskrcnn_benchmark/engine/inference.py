@@ -57,7 +57,7 @@ def compute_on_dataset(model, data_loader, device, synchronize_gather=True, time
 def compute_listener_on_dataset(model, listener, data_loader, device, synchronize_gather=True, timer=None):
     model.eval()
     results_dict = {}
-    listener_loss_func = torch.nn.MarginRankingLoss()
+    listener_loss_func = torch.nn.MarginRankingLoss(margin=1)
     cpu_device = torch.device("cpu")
     torch.cuda.empty_cache()
     for _, batch in enumerate(tqdm(data_loader)):
