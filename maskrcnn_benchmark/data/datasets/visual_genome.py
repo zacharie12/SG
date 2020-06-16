@@ -17,9 +17,10 @@ BOX_SCALE = 1024  # Scale at which we have the boxes
 class VGDataset(torch.utils.data.Dataset):
 
     def __init__(self, split, img_dir, roidb_file, dict_file, image_file, transforms=None,
-                filter_empty_rels=True, num_im=-1, num_val_im=5000,
+                filter_empty_rels=True, num_im=128, num_val_im=16,
                 filter_duplicate_rels=True, filter_non_overlap=True, flip_aug=False):
         """
+
         Torch dataset for VisualGenome
         Parameters:
             split: Must be train, test, or val
@@ -50,7 +51,11 @@ class VGDataset(torch.utils.data.Dataset):
         self.transforms = transforms
 
         self.ind_to_classes, self.ind_to_predicates, self.ind_to_attributes = load_info(dict_file) # contiguous 151, 51 containing __background__
-
+        '''
+        print('IND TO CLASS: ')
+        for i in range(len(self.ind_to_classes)):
+            print(i, self.ind_to_classes[i])
+        '''
         self.categories = {i : self.ind_to_classes[i] for i in range(len(self.ind_to_classes))}
 
         self.split_mask, self.gt_boxes, self.gt_classes, self.gt_attributes, self.relationships = load_graphs(

@@ -87,6 +87,7 @@ class GroupCNN(Cnn):
         )
 
     def forward(self, x):
+        #print('In CNN:', x)
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.conv3(x)

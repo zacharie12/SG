@@ -6,41 +6,49 @@ Basic training script for PyTorch
 # Set up custom environment before nearly anything else is imported
 # NOTE: this should be the first import (no not reorder)
 from maskrcnn_benchmark.utils.env import setup_environment  # noqa F401 isort:skip
-from copy import deepcopy
 import argparse
+import datetime
 import os
 import time
-import datetime
-from pytorch_memlab import profile
+from copy import deepcopy
+
+import PIL
 import torch
-from torch.nn.utils import clip_grad_norm_
-import torchvision
-from torchvision import transforms
+import torch.nn.functional as F
 import torch.distributed as dist
-from maskrcnn_benchmark.config import cfg
-from maskrcnn_benchmark.data import make_data_loader
-from maskrcnn_benchmark.solver import make_lr_scheduler
-from maskrcnn_benchmark.solver import make_optimizer, make_listener_optimizer
-from maskrcnn_benchmark.engine.trainer import reduce_loss_dict
-from maskrcnn_benchmark.engine.inference import listener_inference
-from maskrcnn_benchmark.modeling.detector import build_detection_model
-from maskrcnn_benchmark.utils.checkpoint import DetectronCheckpointer, Checkpointer
-from maskrcnn_benchmark.utils.checkpoint import clip_grad_norm, clip_grad_value
-from maskrcnn_benchmark.utils.collect_env import collect_env_info
-from maskrcnn_benchmark.utils.comm import synchronize, get_rank, all_gather, is_main_process
-from maskrcnn_benchmark.utils.imports import import_file
-from maskrcnn_benchmark.utils.logger import setup_logger, debug_print
-from maskrcnn_benchmark.utils.miscellaneous import mkdir, save_config
-from maskrcnn_benchmark.utils.metric_logger import MetricLogger
-import maskrcnn_benchmark.structures.image_list
-from maskrcnn_benchmark.structures.image_list import to_image_list
-# Speaker Listener imports
-import maskrcnn_benchmark.listener
-from maskrcnn_benchmark.listener.listener import build_listener
-from maskrcnn_benchmark.listener.utils import format_scores, collate_sgs
+import torchvision
 # See if we can use apex.DistributedDataParallel instead of the torch default,
 # and enable mixed-precision via apex.amp
 import wandb
+from PIL import Image
+from pytorch_memlab import profile
+from torch.nn.utils import clip_grad_norm_
+from torchvision import transforms
+
+# Speaker Listener imports
+import maskrcnn_benchmark.listener
+import maskrcnn_benchmark.structures.image_list
+from maskrcnn_benchmark.config import cfg
+from maskrcnn_benchmark.data import make_data_loader
+from maskrcnn_benchmark.engine.inference import listener_inference
+from maskrcnn_benchmark.engine.trainer import reduce_loss_dict
+from maskrcnn_benchmark.listener.listener import build_listener
+from maskrcnn_benchmark.listener.utils import collate_sgs, format_scores
+from maskrcnn_benchmark.modeling.detector import build_detection_model
+from maskrcnn_benchmark.solver import (make_listener_optimizer,
+                                       make_lr_scheduler, make_optimizer)
+from maskrcnn_benchmark.structures.image_list import to_image_list
+from maskrcnn_benchmark.utils.checkpoint import (Checkpointer,
+                                                 DetectronCheckpointer,
+                                                 clip_grad_norm,
+                                                 clip_grad_value)
+from maskrcnn_benchmark.utils.collect_env import collect_env_info
+from maskrcnn_benchmark.utils.comm import (all_gather, get_rank,
+                                           is_main_process, synchronize)
+from maskrcnn_benchmark.utils.imports import import_file
+from maskrcnn_benchmark.utils.logger import debug_print, setup_logger
+from maskrcnn_benchmark.utils.metric_logger import MetricLogger
+from maskrcnn_benchmark.utils.miscellaneous import mkdir, save_config
 
 try:
     from apex import amp
@@ -168,161 +176,209 @@ def train(cfg, local_rank, distributed, logger):
 
     print_first_grad = True
 
-    listener_loss_func = torch.nn.MarginRankingLoss(margin=1, reduction='none')
+    listener_loss_func = torch.nn.MarginRankingLoss(margin=0.2, reduction='none')
+    while True:
+        try:
+            for iteration, (images, targets, _) in enumerate(train_data_loader, start_iter):
+                print(f'ITERATION NUMBER: {iteration}')
+                if any(len(target) < 1 for target in targets):
+                    logger.error(f"Iteration={iteration + 1} || Image Ids used for training {_} || targets Length={[len(target) for target in targets]}" )
+                data_time = time.time() - end
+                iteration = iteration + 1
+                arguments["iteration"] = iteration
 
-    for iteration, (images, targets, _) in enumerate(train_data_loader, start_iter):
-        print(f'ITERATION NUMBER: {iteration}')
-        if any(len(target) < 1 for target in targets):
-            logger.error(f"Iteration={iteration + 1} || Image Ids used for training {_} || targets Length={[len(target) for target in targets]}" )
-        data_time = time.time() - end
-        iteration = iteration + 1
-        arguments["iteration"] = iteration
+                model.train()
+                fix_eval_modules(eval_modules)
 
-        model.train()
-        fix_eval_modules(eval_modules)
+                images_list = deepcopy(images)
+                images_list = to_image_list(images_list, cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
 
-        images_list = deepcopy(images)
-        images_list = to_image_list(images_list, cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
+                '''
+                SAVE IMAGE TO PC
+                is_printed = False
+                if is_main_process():
+                    if not is_printed:
+                        transform = transforms.ToPILImage()
+                        print('SAVING IMAGE')
+                        img = transform(images[0])
+                        print('DONE TRANSFORM')
+                        img.save('img.png')
+                        print('DONE SAVING IMAGE')
+                        is_printed = True
+                '''
+                '''
+                transform = transforms.Compose([
+                    transforms.ToPILImage(),
+                    #transforms.Resize((cfg.LISTENER.IMAGE_SIZE, cfg.LISTENER.IMAGE_SIZE)),
+                    transforms.ToTensor(),
+                ])
+                '''
+                # turn images to a uniform size
+                #print('IMAGE BEFORE Transform: ', images[0], 'GPU: ', get_rank())
+                for i in range(len(images)):
+                    images[i] = images[i].unsqueeze(0)
+                    images[i] = F.interpolate(images[i], size=(224, 224), mode='bilinear', align_corners=False)
+                    images[i] = images[i].squeeze()
 
-        transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((cfg.LISTENER.IMAGE_SIZE, cfg.LISTENER.IMAGE_SIZE)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+                images = torch.stack(images).to(device)
+                #images.requires_grad_()
 
-            # add normalize if we use vgg or resnet
-        ])
-        # turn images to a uniform size
-        for i in range(len(images)):
-            images[i] = transform(images[i])
+                targets = [target.to(device) for target in targets]
 
-        images = torch.stack(images).to(device)
-        #images.requires_grad_()
+                #print('IMAGE BEFORE Model: ', images[0], 'GPU: ', get_rank())
 
-        targets = [target.to(device) for target in targets]
+                _, sgs = model(images_list, targets)
 
-        
-        _, sgs = model(images_list, targets)
-        
-        image_list = None
-        sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
+                #print('IMAGE AFTER Model: ', images)
+                '''is_printed = False
+                if is_main_process():
+                    if not is_printed:
+                        print('PRINTING OBJECTS')
+                        (obj, rel_pair, rel) = sgs[0]
+                        obj = torch.argmax(obj, dim=1)
+                        for i in range(obj.size(0)):
+                            print(f'OBJECT {i}: ', obj[i])
+                        print('DONE PRINTING OBJECTS')
+                        is_printed=True'''
 
-        listener_loss = None
-        avg_acc = 0
-        for true_index, sg in enumerate(sgs):
-            acc = 0
-            detached_sg = (sg[0].detach().requires_grad_(), sg[1], sg[2].detach().requires_grad_() )
-            #scores = listener(sg, images)
-            scores = listener(detached_sg, images)
-            print('SCORES: ', scores)
-            (predicted_scores, true_scores, _) = format_scores(scores, true_index, device)
-            predicted_scores = predicted_scores.t()
-            true_scores = true_scores.t()
-            for i in range(len(predicted_scores)):
-                if predicted_scores[i] < true_scores[i]:
-                    acc += 1
-            
-            acc  = 100*acc / (len(predicted_scores) - 1)
+                
+                image_list = None
+                sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
 
-            (true_tensor, scores, binary) = format_scores(scores, true_index, device)
+                listener_loss = None
+                gap_reward = 0
+                avg_acc = 0
+                num_correct = 0
+                for true_index, sg in enumerate(sgs):
+                    acc = 0
+                    detached_sg = (sg[0].detach().requires_grad_(), sg[1], sg[2].detach().requires_grad_() )
+                    #scores = listener(sg, images)
+                    scores = listener(detached_sg, images)
+                    print('SCORES: ', scores, ' \nRight index: ', true_index)
+                    (predicted_scores, true_scores, _) = format_scores(scores, true_index, device)
+                    predicted_scores = predicted_scores.t()
+                    true_scores = true_scores.t()
+                    is_correct = True
+                    for i in range(len(predicted_scores)):
+                        if predicted_scores[i] < true_scores[i]:
+                            acc += 1
+                        else:
+                            is_correct = False
+                    
+                    acc  = 100*acc / (len(predicted_scores) - 1)
 
-            if listener_loss is None:
-                listener_loss = torch.max(listener_loss_func(true_tensor, scores, binary))
-            else:
-                listener_loss = listener_loss + torch.max(listener_loss_func(true_tensor, scores, binary))
+                    (true_tensor, scores, binary) = format_scores(scores, true_index, device)
+
+                    if listener_loss is None:
+                        listener_loss = torch.max(listener_loss_func(true_tensor, scores, binary))
+                    else:
+                        listener_loss = listener_loss + torch.max(listener_loss_func(true_tensor, scores, binary))
 
 
-            # add a loss term that aims at maximizing the gap between scores, so the model
-            # won't get stuck in a local minima where every pair gets the same score
-            gap_reward = -torch.sum(torch.abs(scores - true_tensor)) * cfg.LISTENER.GAP_COEF / (len(predicted_scores) - 1)
+                    # add a loss term that aims at maximizing the gap between scores, so the model
+                    # won't get stuck in a local minima where every pair gets the same score
+                    if is_correct:
+                        num_correct += 1
+                        if gap_reward == 0:
+                            gap_reward = -torch.sum(torch.abs(scores - true_tensor)) * cfg.LISTENER.GAP_COEF / (len(predicted_scores) - 1)
+                        else:
+                            gap_reward = gap_reward -torch.sum(torch.abs(scores - true_tensor)) * cfg.LISTENER.GAP_COEF / (len(predicted_scores) - 1)                    
 
 
 
-            avg_acc += acc
+                    avg_acc += acc
 
-        avg_acc /= len(sgs)
+                avg_acc /= len(sgs)
 
-        avg_acc = torch.tensor([avg_acc]).to(device)
-        # reduce acc over all gpus
-        avg_acc = {'acc' : avg_acc}
-        avg_acc_reduced = reduce_loss_dict(avg_acc)
-        avg_acc_reduced = sum(acc for acc in avg_acc_reduced.values())
-        # log acc to wadb
-        if is_main_process():
-            wandb.log({"Train Accuracy": avg_acc_reduced.item()})
+                avg_acc = torch.tensor([avg_acc]).to(device)
+                # reduce acc over all gpus
+                avg_acc = {'acc' : avg_acc}
+                avg_acc_reduced = reduce_loss_dict(avg_acc)
+                avg_acc_reduced = sum(acc for acc in avg_acc_reduced.values())
+                # log acc to wadb
+                if is_main_process():
+                    wandb.log({"Train Accuracy": avg_acc_reduced.item()})
 
-        num_sgs = true_index + 1
-        listener_loss /= num_sgs
-        gap_reward /= num_sgs
-        listener_loss *= cfg.LISTENER.LOSS_COEF
-        listener_loss += gap_reward
-        
-        listener_loss = listener_loss.to(device)
-        print('LISTENER_LOSS: ', listener_loss)
-        loss_dict = {
-            'LISTENER_LOSS' : listener_loss
-        }
+                num_sgs = true_index + 1
+                listener_loss /= num_sgs
+                if num_correct != 0:
+                    gap_reward /= num_correct
+                listener_loss *= cfg.LISTENER.LOSS_COEF
+                listener_loss += gap_reward
+                
+                listener_loss = listener_loss.to(device)
+                print('LISTENER_LOSS: ', listener_loss)
+                loss_dict = {
+                    'LISTENER_LOSS' : listener_loss
+                }
 
-        losses = sum(loss for loss in loss_dict.values())
+                losses = sum(loss for loss in loss_dict.values())
 
-        # reduce losses over all GPUs for logging purposes
-        loss_dict_reduced = reduce_loss_dict(loss_dict)
-        losses_reduced = sum(loss for loss in loss_dict_reduced.values())
-        if is_main_process():
-            wandb.log({"Train Loss": losses_reduced})
-        meters.update(loss=losses_reduced, **loss_dict_reduced)
+                # reduce losses over all GPUs for logging purposes
+                loss_dict_reduced = reduce_loss_dict(loss_dict)
+                losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+                if is_main_process():
+                    wandb.log({"Train Loss": losses_reduced})
+                meters.update(loss=losses_reduced, **loss_dict_reduced)
 
-        listener_optimizer.zero_grad()
-        # Note: If mixed precision is not used, this ends up doing nothing
-        # Otherwise apply loss scaling for mixed-precision recipe
-        with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
-            scaled_losses.backward()
-        
-        verbose = (iteration % cfg.SOLVER.PRINT_GRAD_FREQ) == 0 or print_first_grad # print grad or not
-        print_first_grad = False
-        clip_grad_value([(n, p) for n, p in listener.named_parameters() if p.requires_grad], cfg.LISTENER.CLIP_VALUE, logger=logger, verbose=True, clip=True)
-        listener_optimizer.step()
+                listener_optimizer.zero_grad()
+                # Note: If mixed precision is not used, this ends up doing nothing
+                # Otherwise apply loss scaling for mixed-precision recipe
+                with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
+                    scaled_losses.backward()
+                
+                verbose = (iteration % cfg.SOLVER.PRINT_GRAD_FREQ) == 0 or print_first_grad # print grad or not
+                print_first_grad = False
+                #clip_grad_value([(n, p) for n, p in listener.named_parameters() if p.requires_grad], cfg.LISTENER.CLIP_VALUE, logger=logger, verbose=True, clip=True)
+                listener_optimizer.step()
 
-        batch_time = time.time() - end
-        end = time.time()
-        meters.update(time=batch_time, data=data_time)
+                batch_time = time.time() - end
+                end = time.time()
+                meters.update(time=batch_time, data=data_time)
 
-        eta_seconds = meters.time.global_avg * (max_iter - iteration)
-        eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+                eta_seconds = meters.time.global_avg * (max_iter - iteration)
+                eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
-        if iteration % 200 == 0 or iteration == max_iter:
-            logger.info(
-                meters.delimiter.join(
-                    [
-                        "eta: {eta}",
-                        "iter: {iter}",
-                        "{meters}",
-                        "lr: {lr:.6f}",
-                        "max mem: {memory:.0f}",
-                    ]
-                ).format(
-                    eta=eta_string,
-                    iter=iteration,
-                    meters=str(meters),
-                    lr=listener_optimizer.param_groups[-1]["lr"],
-                    memory=torch.cuda.max_memory_allocated() / 1024.0 / 1024.0,
-                )
+                if iteration % 200 == 0 or iteration == max_iter:
+                    logger.info(
+                        meters.delimiter.join(
+                            [
+                                "eta: {eta}",
+                                "iter: {iter}",
+                                "{meters}",
+                                "lr: {lr:.6f}",
+                                "max mem: {memory:.0f}",
+                            ]
+                        ).format(
+                            eta=eta_string,
+                            iter=iteration,
+                            meters=str(meters),
+                            lr=listener_optimizer.param_groups[-1]["lr"],
+                            memory=torch.cuda.max_memory_allocated() / 1024.0 / 1024.0,
+                        )
+                    )
+
+                if iteration % checkpoint_period == 0:
+                    listener_checkpointer.save("model_{:07d}".format(iteration), **arguments)
+                if iteration == max_iter:
+                    listener_checkpointer.save("model_final", **arguments)
+
+                val_result = None # used for scheduler updating
+                if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
+                    logger.info("Start validating")
+                    val_result = run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+                    if is_main_process():
+                        wandb.log({"Validation Loss": val_result})
+                    logger.info("Validation Result: %.4f" % val_result)
+        except:
+            train_data_loader = make_data_loader(
+                cfg,
+                mode='train',
+                is_distributed=distributed,
+                start_iter=arguments["iteration"],
+                ret_images=True
             )
-
-        if iteration % checkpoint_period == 0:
-           listener_checkpointer.save("model_{:07d}".format(iteration), **arguments)
-        if iteration == max_iter:
-            listener_checkpointer.save("model_final", **arguments)
-
-        val_result = None # used for scheduler updating
-        if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
-            logger.info("Start validating")
-            val_result = run_val(cfg, model, listener, val_data_loaders, distributed, logger)
-            if is_main_process():
-                wandb.log({"Validation Loss": val_result})
-            logger.info("Validation Result: %.4f" % val_result)
- 
-
+    
     total_training_time = time.time() - start_training_time
     total_time_str = str(datetime.timedelta(seconds=total_training_time))
     logger.info(

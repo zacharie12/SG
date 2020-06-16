@@ -32,7 +32,8 @@ def build_transforms(cfg, is_train=True):
         saturation=saturation,
         hue=hue,
     )
-
+    #NORMAL
+    '''  
     transform = T.Compose(
         [
             color_jitter,
@@ -43,4 +44,18 @@ def build_transforms(cfg, is_train=True):
             normalize_transform,
         ]
     )
+    '''
+    #OVERFIT 
+      
+    transform = T.Compose(
+        [
+            #color_jitter,
+            T.Resize(min_size, max_size),
+            #T.RandomHorizontalFlip(flip_horizontal_prob),
+            #T.RandomVerticalFlip(flip_vertical_prob),
+            T.ToTensor(),
+            normalize_transform,
+        ]
+    )
     return transform
+    

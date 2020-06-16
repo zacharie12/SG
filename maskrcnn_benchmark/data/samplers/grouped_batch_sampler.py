@@ -40,7 +40,7 @@ class GroupedBatchSampler(BatchSampler):
     def _prepare_batches(self):
         dataset_size = len(self.group_ids)
         # get the sampled indices from the sampler
-        sampled_ids = torch.as_tensor(list(self.sampler))
+        sampled_ids = torch.as_tensor(list(self.sampler), dtype=torch.long)
         # potentially not all elements of the dataset were sampled
         # by the sampler (e.g., DistributedSampler).
         # construct a tensor which contains -1 if the element was
@@ -64,12 +64,11 @@ class GroupedBatchSampler(BatchSampler):
         permutation_ids = [s[s.sort()[1]] for s in relative_order]
         # permute each cluster so that they follow the order from
         # the sampler
+        
         permuted_clusters = [sampled_ids[idx] for idx in permutation_ids]
-
         # splits each cluster in batch_size, and merge as a list of tensors
         splits = [c.split(self.batch_size) for c in permuted_clusters]
         merged = tuple(itertools.chain.from_iterable(splits))
-
         # now each batch internally has the right order, but
         # they are grouped by clusters. Find the permutation between
         # different batches that brings them as close as possible to

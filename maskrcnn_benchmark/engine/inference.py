@@ -36,6 +36,8 @@ def compute_on_dataset(model, data_loader, device, synchronize_gather=True, time
             else:
                 # relation detection needs the targets
                 output = model(images.to(device), targets)
+                print('SG output: ', output[0].extra_fields)
+
             if timer:
                 if not cfg.MODEL.DEVICE == 'cpu':
                     torch.cuda.synchronize()

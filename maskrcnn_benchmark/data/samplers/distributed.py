@@ -46,6 +46,7 @@ class DistributedSampler(Sampler):
             g.manual_seed(self.epoch)
             indices = torch.randperm(len(self.dataset), generator=g).tolist()
         else:
+
             indices = torch.arange(len(self.dataset)).tolist()
 
         # add extra samples to make it evenly divisible

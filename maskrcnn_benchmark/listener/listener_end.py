@@ -46,6 +46,14 @@ class BNFC(ListenerEnd):
     def forward(self, x):
         return self.fc(x)
 
+'''
+TODO: finish this
+class CosineDistance(ListenerEnd):
+    def __init__(self, input_size):
+        super(FC, self).__init__()
+
+'''
+
 # TODO: Dropout
 class DropoutFC(ListenerEnd):
     def __init__(self, input_size):

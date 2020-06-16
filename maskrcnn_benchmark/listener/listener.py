@@ -4,6 +4,7 @@ import typing
 from .cnn import *
 from .gnn import *
 from .listener_end import *
+import torch.nn.functional as F
 
 class Listener(nn.Module):
     def __init__(self, gnn_t : Gnn, cnn_t : Cnn, listener_end_t : ListenerEnd):
@@ -12,8 +13,14 @@ class Listener(nn.Module):
         self.cnn = cnn_t
         self.listener_end = listener_end_t
     
-        self.apply(init_model)
+        def init_weights(m):
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
 
+        self.apply(init_weights)
+        
     def forward(self, sg, image):
         g_feature = self.gnn(sg)
         im_feature = self.cnn(image)
@@ -23,13 +30,7 @@ class Listener(nn.Module):
         g_feature = g_feature.reshape(batch_size, -1)
 
         feature = torch.cat((g_feature, im_feature), dim=1)
-        return self.listener_end(feature)
-
-
-def init_model(m):
-    if type(m) == nn.Conv2d or type(m) == nn.Linear:
-        nn.init.xavier_uniform_(m.weight)
-
+        return F.softmax(self.listener_end(feature), dim=0)
 
 def build_listener(cfg):
     listener = Listener(build_gnn(cfg), build_cnn(cfg), build_end(cfg))
@@ -37,7 +38,7 @@ def build_listener(cfg):
     
 if __name__ == '__main__':
     gnn = SimpleGCN(1, 2)
-    cnn = SimpleCNN(24, 24, 3, 4)
+    cnn = GroupCNN(24, 24, 3, 4)
     fc = FC(5)
     listener = Listener(gnn, cnn, fc)
 
