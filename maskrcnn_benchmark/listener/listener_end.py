@@ -46,14 +46,6 @@ class BNFC(ListenerEnd):
     def forward(self, x):
         return self.fc(x)
 
-'''
-TODO: finish this
-class CosineDistance(ListenerEnd):
-    def __init__(self, input_size):
-        super(FC, self).__init__()
-
-'''
-
 # TODO: Dropout
 class DropoutFC(ListenerEnd):
     def __init__(self, input_size):
@@ -73,12 +65,25 @@ class DropoutFC(ListenerEnd):
         )
 
     def forward(self, x):
-        print('Fuckkk')
         return self.fc(x)
 
 
+class CosineDistance(ListenerEnd):
+    def __init__(self, input_size):
+        super(CosineDistance, self).__init__()
+        self.input_size = input_size
+        self.dist = nn.CosineSimilarity()
 
-END_ARCHITECHTURE = { 'FC' : FC , 'BNFC' : BNFC, 'DropoutFC':DropoutFC}
+    def forward(self, x):   
+        feature_len = self.input_size // 2
+        first_feat = x.t()[:feature_len].t()
+        second_feat = x.t()[feature_len:].t()
+
+        return self.dist(first_feat, second_feat)
+
+
+
+END_ARCHITECHTURE = { 'FC' : FC , 'BNFC' : BNFC, 'DropoutFC':DropoutFC, 'CosineDistance':CosineDistance}
 def build_end(cfg):
     end = END_ARCHITECHTURE[cfg.LISTENER.END](cfg.LISTENER.CNN_OUTPUT + cfg.LISTENER.GNN_OUTPUT)
     return end

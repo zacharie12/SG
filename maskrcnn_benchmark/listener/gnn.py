@@ -20,6 +20,8 @@ class SimpleGNN(Gnn):
         self.conv1 = CGConv(in_channels, dim, aggr='add', bias=True)
         self.conv2 = CGConv(in_channels, dim,  aggr='add', bias=True)
 
+        self.lin = nn.Linear(in_channels, out_size)
+
     def forward(self, sg):
         x, edge_idx, edge_w = sg
         x = x.float()
@@ -33,6 +35,7 @@ class SimpleGNN(Gnn):
         device = x.get_device()
         batch = torch.zeros((N), dtype=torch.long, device=device)
         x = global_mean_pool(x, batch)
+        x = self.lin(x)
         return x
 
 class GaussGNN(Gnn):
@@ -41,7 +44,7 @@ class GaussGNN(Gnn):
         self.conv1 = GMMConv(in_channels, in_channels,  dim, kernel_size=25)
         self.conv2 = GMMConv(in_channels, in_channels,  dim, kernel_size=25)
         self.conv3 = GMMConv(in_channels, in_channels,  dim, kernel_size=25)
-        self.linear = nn.Linear(in_channels, in_channels)
+        self.linear = nn.Linear(in_channels, out_size)
         '''
         self.pooling = GlobalAttention(
             nn.Sequential(
@@ -65,11 +68,12 @@ class GaussGNN(Gnn):
         x = F.relu(x)
         #x = F.dropout(x, training=self.training)
         x = self.conv3(x, edge_idx, edge_w)
-        x = self.linear(x)
         
         device = x.get_device()
         batch = torch.zeros((N), dtype=torch.long, device=device)
         x = global_mean_pool(x, batch)
+        x = self.linear(x)
+
         return x
 
 

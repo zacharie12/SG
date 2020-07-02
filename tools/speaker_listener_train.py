@@ -335,8 +335,10 @@ def train(cfg, local_rank, distributed, logger):
                 listener_optimizer.zero_grad()
                 # Note: If mixed precision is not used, this ends up doing nothing
                 # Otherwise apply loss scaling for mixed-precision recipe
-                with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
-                    scaled_losses.backward()
+
+                losses_reduced.backward()
+                #with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
+                #    scaled_losses.backward()
                 
                 verbose = (iteration % cfg.SOLVER.PRINT_GRAD_FREQ) == 0 or print_first_grad # print grad or not
                 print_first_grad = False

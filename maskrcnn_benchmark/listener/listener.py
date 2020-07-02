@@ -12,14 +12,6 @@ class Listener(nn.Module):
         self.gnn = gnn_t
         self.cnn = cnn_t
         self.listener_end = listener_end_t
-    
-        def init_weights(m):
-            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
-
-        self.apply(init_weights)
         
     def forward(self, sg, image):
         g_feature = self.gnn(sg)

@@ -122,8 +122,8 @@ def make_listener_optimizer(cfg, model):
     params = []
     for key, value in model.named_parameters():
         params += [{'params': [value]}]
-    #optimizer = torch.optim.Adam(params, lr=cfg.LISTENER.LR)
-    optimizer = LARS(params, lr=cfg.LISTENER.LR)
+    optimizer = torch.optim.Adam(params, lr=cfg.LISTENER.LR)
+    #optimizer = LARS(params, lr=cfg.LISTENER.LR)
     return optimizer
 
 def make_lr_scheduler(cfg, optimizer, logger=None):
