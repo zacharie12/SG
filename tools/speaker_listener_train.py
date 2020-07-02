@@ -456,7 +456,7 @@ def run_val(cfg, model, listener, val_data_loaders, distributed, logger):
         final_result.append(val_result)
         del gathered_result, valid_result
         torch.cuda.empty_cache()
-    return Tuple(final_result)
+    return tuple(final_result)
 
 def run_test(cfg, model, listener, distributed, logger):
     if distributed:

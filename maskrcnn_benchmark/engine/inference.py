@@ -130,16 +130,16 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
                     torch.cuda.synchronize()
                 timer.toc()
             output = [o.to(cpu_device) for o in output]
-            accuracy = [torch.Tensor(acc).to(cpu_device) for acc in accuracy]
+            accuracy = [torch.Tensor([acc]).to(cpu_device) for acc in accuracy]
         if synchronize_gather:
             synchronize()
-            multi_gpu_predictions = all_gather({img_id: result for img_id, result, accuracy in zip(image_ids, output, accuracy)})
+            multi_gpu_predictions = all_gather({img_id: (result, accuracy) for img_id, result, accuracy in zip(image_ids, output, accuracy)})
             if is_main_process():
                 for p in multi_gpu_predictions:
                     results_dict.update(p)
         else:
             results_dict.update(
-                {img_id: result for img_id, result, accuracy in zip(image_ids, output, accuracy)}
+                {img_id: (result, accuracy) for img_id, result, accuracy in zip(image_ids, output, accuracy)}
             )
     torch.cuda.empty_cache()
     return results_dict
@@ -306,9 +306,13 @@ def listener_inference(
         expected_results_sigma_tol=expected_results_sigma_tol,
     )
 
-    print('PREDICTIONS', predictions)
+    predictions = [[predictions[i][j] for i in range(len(predictions))] for j in range(len(predictions[0]))]
 
-    loss_sum = sum(predictions)
-    loss_mean = loss_sum / (len(predictions) - (cfg.TEST.IMS_PER_BATCH/cfg.NUM_GPUS))
-    return loss_mean
+    loss_sum = sum(predictions[0])
+    loss_mean = loss_sum / (len(predictions[0]) - (cfg.TEST.IMS_PER_BATCH/cfg.NUM_GPUS))
+
+    acc_sum = sum(predictions[1])
+    acc_mean = acc_sum / (len(predictions[1]) - (cfg.TEST.IMS_PER_BATCH/cfg.NUM_GPUS))
+
+    return (loss_mean, acc_mean)
 
