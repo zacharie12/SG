@@ -30,7 +30,7 @@ class Listener(nn.Module):
 
         feature = torch.cat((g_feature, im_feature), dim=1)
         #return F.softmax(self.listener_end(feature), dim=0)
-        return F.tanh(self.listener_end(feature))
+        return self.listener_end(feature)
 
 def build_listener(cfg):
     listener = Listener(build_gnn(cfg), build_cnn(cfg), build_end(cfg))

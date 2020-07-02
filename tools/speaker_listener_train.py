@@ -165,7 +165,7 @@ def train(cfg, local_rank, distributed, logger):
 
     if cfg.SOLVER.PRE_VAL:
         logger.info("Validate before training")
-        (loss_val, acc) =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+        #(loss_val, acc) =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
 
     logger.info("Start training")
     meters = MetricLogger(delimiter="  ")
