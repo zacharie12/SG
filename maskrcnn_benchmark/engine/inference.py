@@ -19,6 +19,8 @@ from maskrcnn_benchmark.listener.utils import format_scores, collate_sgs
 from copy import deepcopy
 import torchvision
 from torchvision import transforms
+import torch.nn.functional as F
+
 
 def compute_on_dataset(model, data_loader, device, synchronize_gather=True, timer=None):
     model.eval()
@@ -59,7 +61,7 @@ def compute_on_dataset(model, data_loader, device, synchronize_gather=True, time
 def compute_listener_on_dataset(model, listener, data_loader, device, synchronize_gather=True, timer=None):
     model.eval()
     results_dict = {}
-    listener_loss_func = torch.nn.MarginRankingLoss(margin=1)
+    listener_loss_func = torch.nn.MarginRankingLoss(margin=0.2, reduction='none')
     cpu_device = torch.device("cpu")
     torch.cuda.empty_cache()
     for _, batch in enumerate(tqdm(data_loader)):
@@ -69,15 +71,10 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
             images_list = deepcopy(images)
             #images_list = to_image_list(images_list, cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
 
-            transform = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Resize((cfg.LISTENER.IMAGE_SIZE, cfg.LISTENER.IMAGE_SIZE)),
-                transforms.ToTensor(),
-                # add normalize if we use vgg or resnet
-            ])
-            # turn images to a uniform size
             for i in range(len(images)):
-                images[i] = transform(images[i])
+                images[i] = images[i].unsqueeze(0)
+                images[i] = F.interpolate(images[i], size=(224, 224), mode='bilinear', align_corners=False)
+                images[i] = images[i].squeeze()
 
             images = torch.stack(images).to(device)
 
@@ -97,12 +94,35 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
                 
                 sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
 
-                listener_loss = None
+                accuracy = []
+                listener_loss = 0
                 for true_index, sg in enumerate(sgs):
+                    acc = 0
                     detached_sg = (sg[0], sg[1], sg[2])
                     #scores = listener(sg, images)
                     scores = listener(detached_sg, images)
-                    listener_loss = listener_loss_func(*format_scores(scores, true_index, device))
+                    # calculate accuracy
+                    (true_scores, predicted_scores, _) = format_scores(scores, true_index, device)
+                    predicted_scores = predicted_scores.t()
+                    true_scores = true_scores.t()
+                    is_correct = True
+                    for i in range(len(predicted_scores)):
+                        if predicted_scores[i] < true_scores[i]:
+                            acc += 1
+                        else:
+                            is_correct = False
+                    
+                    acc  = 100*acc / (len(predicted_scores) - 1)
+                    accuracy.append(acc)
+                    # calculate loss
+                    loss_vec = listener_loss_func(*format_scores(scores, true_index, device))
+                    
+                    loss_vec = loss_vec.t().squeeze()
+                    loss_vec = torch.cat([loss_vec[0:true_index], loss_vec[true_index+1:]])
+                    loss_vec = loss_vec.t()
+
+                    listener_loss = torch.max(loss_vec)
+
                     output.append(listener_loss)
 
             if timer:
@@ -110,15 +130,16 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
                     torch.cuda.synchronize()
                 timer.toc()
             output = [o.to(cpu_device) for o in output]
+            accuracy = [torch.Tensor(acc).to(cpu_device) for acc in accuracy]
         if synchronize_gather:
             synchronize()
-            multi_gpu_predictions = all_gather({img_id: result for img_id, result in zip(image_ids, output)})
+            multi_gpu_predictions = all_gather({img_id: result for img_id, result, accuracy in zip(image_ids, output, accuracy)})
             if is_main_process():
                 for p in multi_gpu_predictions:
                     results_dict.update(p)
         else:
             results_dict.update(
-                {img_id: result for img_id, result in zip(image_ids, output)}
+                {img_id: result for img_id, result, accuracy in zip(image_ids, output, accuracy)}
             )
     torch.cuda.empty_cache()
     return results_dict
@@ -284,6 +305,8 @@ def listener_inference(
         expected_results=expected_results,
         expected_results_sigma_tol=expected_results_sigma_tol,
     )
+
+    print('PREDICTIONS', predictions)
 
     loss_sum = sum(predictions)
     loss_mean = loss_sum / (len(predictions) - (cfg.TEST.IMS_PER_BATCH/cfg.NUM_GPUS))

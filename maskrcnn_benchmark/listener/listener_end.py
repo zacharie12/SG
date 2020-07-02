@@ -73,6 +73,7 @@ class DropoutFC(ListenerEnd):
         )
 
     def forward(self, x):
+        print('Fuckkk')
         return self.fc(x)
 
 

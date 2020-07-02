@@ -19,14 +19,6 @@ class SimpleGNN(Gnn):
         super(SimpleGNN, self).__init__()
         self.conv1 = CGConv(in_channels, dim, aggr='add', bias=True)
         self.conv2 = CGConv(in_channels, dim,  aggr='add', bias=True)
-        self.pooling = GlobalAttention(
-            nn.Sequential(
-                nn.Linear(in_channels, 1)
-            ),
-            nn.Sequential(
-                nn.Linear(in_channels, in_channels)
-            )
-        )
 
     def forward(self, sg):
         x, edge_idx, edge_w = sg
@@ -38,8 +30,9 @@ class SimpleGNN(Gnn):
         x = F.dropout(x, training=self.training)
         x = self.conv2(x, edge_idx, edge_w)
         device = x.get_device()
+        device = x.get_device()
         batch = torch.zeros((N), dtype=torch.long, device=device)
-        x = self.pooling(x, batch)
+        x = global_mean_pool(x, batch)
         return x
 
 class GaussGNN(Gnn):
@@ -199,18 +192,21 @@ class EAGNN_layer(nn.Module):
             edges = torch.index_select(edge_weights, 0, edge_indices)
             
             X = x[node_idx].repeat(len(dest_idx)).view((dest_idx.size(0), self.in_size))
-        
+
             concat_feat = torch.cat((X, edges, dest_features), dim=1)
+            # calculae new features for edges
+            edge_w = self.edge_lin(concat_feat)
+            # assign them to new edge feature matrix
+            new_edge[edge_indices] = edge_w
 
-            att_scores = self.att(concat_feat)
+            # calculate attention logits for pooling of edges messege pass
+            att_scores = self.att(edge_w)
             att_logits = F.softmax(att_scores, dim=0)
-
-            dest_features_lin = torch.index_select(dest_features_linearized, 0, dest_idx)
-
-            hidden_t = (att_logits.view(-1, 1) * dest_features_lin).sum(dim=0).unsqueeze(dim=0)
+            # apply GRU update
+            hidden_t = (att_logits.view(-1, 1) * edge_w).sum(dim=0).unsqueeze(dim=0)
             new_x.append(self.gru(x[node_idx].unsqueeze(dim=0), hidden_t).squeeze())
             
-        return torch.stack(new_x)  
+        return torch.stack(new_x), new_edge
 
 
 class AGNN(Gnn):
@@ -220,16 +216,6 @@ class AGNN(Gnn):
         self.conv2 = AGNN_layer(in_channels, dim)
         self.conv3 = AGNN_layer(in_channels, dim)
         self.linear = nn.Linear(in_channels, out_size)
-        '''
-        self.pooling = GlobalAttention(
-            nn.Sequential(
-                nn.Linear(in_channels, 1),
-            ),
-            nn.Sequential(
-                nn.Linear(in_channels, in_channels)
-            )
-        )
-        '''
 
     def forward(self, sg):
         x, edge_idx, edge_w = sg
@@ -251,7 +237,40 @@ class AGNN(Gnn):
         return x
 
 
-GNN_ARCHITECHTURE = {'SimpleGNN':SimpleGNN, 'GaussGNN':GaussGNN, 'AGNN':AGNN }
+class EAGNN(Gnn):
+    def __init__(self, in_channels, dim, out_size):
+        super(EAGNN, self).__init__()
+        self.conv1 = EAGNN_layer(in_channels, dim)
+        self.conv2 = EAGNN_layer(in_channels, dim)
+        self.conv3 = EAGNN_layer(in_channels, dim)
+        self.linear = nn.Linear(in_channels, out_size)
+        '''
+        self.pooling = GlobalAttention(
+            nn.Sequential(
+                nn.Linear(in_channels, 1),
+            ),
+            nn.Sequential(
+                nn.Linear(in_channels, in_channels)
+            )
+        )
+        '''
+
+    def forward(self, sg):
+        x, edge_idx, edge_w = sg
+        # x = x.float()
+        # edge_w = edge_w.float()
+        N = len(x)
+        x, edge_w = self.conv1(x, edge_idx, edge_w)
+        x, edge_w = self.conv2(x, edge_idx, edge_w)
+        x, edge_w = self.conv3(x, edge_idx, edge_w)
+        x = self.linear(x)
+        
+        device = x.get_device()
+        batch = torch.zeros((N), dtype=torch.long, device=device)
+        x = global_mean_pool(x, batch)
+        return x
+
+GNN_ARCHITECHTURE = {'SimpleGNN':SimpleGNN, 'GaussGNN':GaussGNN, 'AGNN':AGNN, 'EAGNN':EAGNN }
 def build_gnn(cfg):
     gnn = GNN_ARCHITECHTURE[cfg.LISTENER.GNN](cfg.LISTENER.NODE_SIZE, cfg.LISTENER.EDGE_SIZE, cfg.LISTENER.GNN_OUTPUT)
     return gnn

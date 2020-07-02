@@ -24,13 +24,13 @@ class Listener(nn.Module):
     def forward(self, sg, image):
         g_feature = self.gnn(sg)
         im_feature = self.cnn(image)
-
         batch_size = im_feature.size(0)
         g_feature = g_feature.repeat(batch_size, 1)
         g_feature = g_feature.reshape(batch_size, -1)
 
         feature = torch.cat((g_feature, im_feature), dim=1)
-        return F.softmax(self.listener_end(feature), dim=0)
+        #return F.softmax(self.listener_end(feature), dim=0)
+        return F.tanh(self.listener_end(feature))
 
 def build_listener(cfg):
     listener = Listener(build_gnn(cfg), build_cnn(cfg), build_end(cfg))
@@ -43,7 +43,6 @@ if __name__ == '__main__':
     listener = Listener(gnn, cnn, fc)
 
     x = torch.zeros((4, 1))
-    print(x)
     im = torch.zeros((3, 3, 24, 24)) 
     y = torch.tensor([[0, 1, 1, 2],
                     [1, 0, 2, 3]], dtype=torch.long)

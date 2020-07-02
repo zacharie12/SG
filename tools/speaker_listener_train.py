@@ -33,7 +33,7 @@ from maskrcnn_benchmark.data import make_data_loader
 from maskrcnn_benchmark.engine.inference import listener_inference
 from maskrcnn_benchmark.engine.trainer import reduce_loss_dict
 from maskrcnn_benchmark.listener.listener import build_listener
-from maskrcnn_benchmark.listener.utils import collate_sgs, format_scores
+from maskrcnn_benchmark.listener.utils import collate_sgs, format_scores, format_scores_reg
 from maskrcnn_benchmark.modeling.detector import build_detection_model
 from maskrcnn_benchmark.solver import (make_listener_optimizer,
                                        make_lr_scheduler, make_optimizer)
@@ -165,7 +165,7 @@ def train(cfg, local_rank, distributed, logger):
 
     if cfg.SOLVER.PRE_VAL:
         logger.info("Validate before training")
-        #loss_val =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+        (loss_val, acc) =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
 
     logger.info("Start training")
     meters = MetricLogger(delimiter="  ")
@@ -177,12 +177,17 @@ def train(cfg, local_rank, distributed, logger):
     print_first_grad = True
 
     listener_loss_func = torch.nn.MarginRankingLoss(margin=0.2, reduction='none')
+    #reg_loss = torch.nn.MSELoss(reduction='none')
+
     while True:
         try:
             for iteration, (images, targets, _) in enumerate(train_data_loader, start_iter):
                 print(f'ITERATION NUMBER: {iteration}')
                 if any(len(target) < 1 for target in targets):
                     logger.error(f"Iteration={iteration + 1} || Image Ids used for training {_} || targets Length={[len(target) for target in targets]}" )
+                if len(images) <= 1:
+                    continue
+
                 data_time = time.time() - end
                 iteration = iteration + 1
                 arguments["iteration"] = iteration
@@ -245,7 +250,7 @@ def train(cfg, local_rank, distributed, logger):
                 image_list = None
                 sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
 
-                listener_loss = None
+                listener_loss = 0
                 gap_reward = 0
                 avg_acc = 0
                 num_correct = 0
@@ -255,7 +260,7 @@ def train(cfg, local_rank, distributed, logger):
                     #scores = listener(sg, images)
                     scores = listener(detached_sg, images)
                     print('SCORES: ', scores, ' \nRight index: ', true_index)
-                    (predicted_scores, true_scores, _) = format_scores(scores, true_index, device)
+                    (true_scores, predicted_scores, _) = format_scores(scores, true_index, device)
                     predicted_scores = predicted_scores.t()
                     true_scores = true_scores.t()
                     is_correct = True
@@ -268,13 +273,21 @@ def train(cfg, local_rank, distributed, logger):
                     acc  = 100*acc / (len(predicted_scores) - 1)
 
                     (true_tensor, scores, binary) = format_scores(scores, true_index, device)
+                    #scores, target = format_scores_reg(scores, true_index, device)
 
-                    if listener_loss is None:
-                        listener_loss = torch.max(listener_loss_func(true_tensor, scores, binary))
-                    else:
-                        listener_loss = listener_loss + torch.max(listener_loss_func(true_tensor, scores, binary))
+                    loss_vec = listener_loss_func(true_tensor, scores, binary)
+                    #loss_vec = reg_loss(scores, target)
 
+                    # remove the loss of the true example against itself
+                    #positive_loss = loss_vec[true_index]
+                    
+                    loss_vec = loss_vec.t().squeeze()
+                    loss_vec = torch.cat([loss_vec[0:true_index], loss_vec[true_index+1:]])
+                    loss_vec = loss_vec.t()
 
+                    listener_loss = listener_loss + torch.max(loss_vec)
+
+                    #listener_loss = listener_loss + positive_loss.item()
                     # add a loss term that aims at maximizing the gap between scores, so the model
                     # won't get stuck in a local minima where every pair gets the same score
                     if is_correct:
@@ -299,15 +312,13 @@ def train(cfg, local_rank, distributed, logger):
                 if is_main_process():
                     wandb.log({"Train Accuracy": avg_acc_reduced.item()})
 
-                num_sgs = true_index + 1
-                listener_loss /= num_sgs
+                listener_loss /= len(sgs)
                 if num_correct != 0:
                     gap_reward /= num_correct
                 listener_loss *= cfg.LISTENER.LOSS_COEF
                 listener_loss += gap_reward
                 
                 listener_loss = listener_loss.to(device)
-                print('LISTENER_LOSS: ', listener_loss)
                 loss_dict = {
                     'LISTENER_LOSS' : listener_loss
                 }
@@ -367,8 +378,10 @@ def train(cfg, local_rank, distributed, logger):
                 if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
                     logger.info("Start validating")
                     val_result = run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+                    (val_loss, val_acc) = val_result
                     if is_main_process():
-                        wandb.log({"Validation Loss": val_result})
+                        wandb.log({"Validation Loss": val_loss})
+                        wandb.log({"Validation Accuracy": val_acc})
                     logger.info("Validation Result: %.4f" % val_result)
         except:
             train_data_loader = make_data_loader(
@@ -426,17 +439,24 @@ def run_val(cfg, model, listener, val_data_loaders, distributed, logger):
                             logger=logger,
                         )
         synchronize()
+        if type(dataset_result) is not tuple:
+            dataset_result = (dataset_result,)
+
         val_result.append(dataset_result)
-    # support for multi gpu distributed testing
-    print('VAL_RESULT: ', val_result)
-    gathered_result = all_gather(torch.tensor(val_result).cpu())
-    gathered_result = [t.view(-1) for t in gathered_result]
-    gathered_result = torch.cat(gathered_result, dim=-1).view(-1)
-    valid_result = gathered_result[gathered_result>=0]
-    val_result = float(valid_result.mean())
-    del gathered_result, valid_result
-    torch.cuda.empty_cache()
-    return val_result
+    
+    organized_result = [[val_result[i][j] for i in range(len(val_result))] for j in range(len(val_result[0]))]
+    final_result = []
+    for i in range(len(organized_result)):
+        # support for multi gpu distributed testing
+        gathered_result = all_gather(torch.tensor(organized_result[i]).cpu())
+        gathered_result = [t.view(-1) for t in gathered_result]
+        gathered_result = torch.cat(gathered_result, dim=-1).view(-1)
+        valid_result = gathered_result[gathered_result>=0]
+        val_result = float(valid_result.mean())
+        final_result.append(val_result)
+        del gathered_result, valid_result
+        torch.cuda.empty_cache()
+    return Tuple(final_result)
 
 def run_test(cfg, model, listener, distributed, logger):
     if distributed:

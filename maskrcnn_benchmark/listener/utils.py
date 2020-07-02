@@ -7,6 +7,12 @@ def format_scores(scores, true_index, device):
 
     return true_tensor.t(), scores.t(), binary
         
+def format_scores_reg(scores, true_index, device):
+    target = - torch.ones(scores.size())
+    target[true_index] = 1
+    target = target.to(device)
+
+    return scores, target
 
 def collate_sgs(sgs, device):
     output = []
