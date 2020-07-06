@@ -58,7 +58,7 @@ except ImportError:
 @profile
 def train(cfg, local_rank, distributed, logger):
     if is_main_process():
-        wandb.init(project='scene-graph', entity='sgg-speaker-listener')
+        wandb.init(project='scene-graph', entity='sgg-speaker-listener', config=cfg.LISTENER)
     debug_print(logger, 'prepare training')
     model = build_detection_model(cfg)
     listener = build_listener(cfg)
@@ -176,7 +176,7 @@ def train(cfg, local_rank, distributed, logger):
 
     print_first_grad = True
 
-    listener_loss_func = torch.nn.MarginRankingLoss(margin=0.2, reduction='none')
+    listener_loss_func = torch.nn.MarginRankingLoss(margin=1, reduction='none')
     #reg_loss = torch.nn.MSELoss(reduction='none')
 
     while True:
@@ -254,92 +254,117 @@ def train(cfg, local_rank, distributed, logger):
                 gap_reward = 0
                 avg_acc = 0
                 num_correct = 0
+                score_matrix = torch.zeros( (images.size(0), images.size(0)) )
+                # fill score matrix
                 for true_index, sg in enumerate(sgs):
                     acc = 0
                     detached_sg = (sg[0].detach().requires_grad_(), sg[1], sg[2].detach().requires_grad_() )
                     #scores = listener(sg, images)
                     scores = listener(detached_sg, images)
-                    print('SCORES: ', scores, ' \nRight index: ', true_index)
-                    (true_scores, predicted_scores, _) = format_scores(scores, true_index, device)
-                    predicted_scores = predicted_scores.t()
-                    true_scores = true_scores.t()
-                    is_correct = True
-                    for i in range(len(predicted_scores)):
-                        if predicted_scores[i] < true_scores[i]:
-                            acc += 1
-                        else:
-                            is_correct = False
-                    
-                    acc  = 100*acc / (len(predicted_scores) - 1)
+                    score_matrix[true_index] = scores
 
-                    (true_tensor, scores, binary) = format_scores(scores, true_index, device)
-                    #scores, target = format_scores_reg(scores, true_index, device)
-
-                    loss_vec = listener_loss_func(true_tensor, scores, binary)
-                    #loss_vec = reg_loss(scores, target)
-
-                    # remove the loss of the true example against itself
-                    #positive_loss = loss_vec[true_index]
-                    
-                    loss_vec = loss_vec.t().squeeze()
-                    loss_vec = torch.cat([loss_vec[0:true_index], loss_vec[true_index+1:]])
-                    loss_vec = loss_vec.t()
-
-                    listener_loss = listener_loss + torch.max(loss_vec)
-
-                    #listener_loss = listener_loss + positive_loss.item()
-                    # add a loss term that aims at maximizing the gap between scores, so the model
-                    # won't get stuck in a local minima where every pair gets the same score
-                    if is_correct:
-                        num_correct += 1
-                        if gap_reward == 0:
-                            gap_reward = -torch.sum(torch.abs(scores - true_tensor)) * cfg.LISTENER.GAP_COEF / (len(predicted_scores) - 1)
-                        else:
-                            gap_reward = gap_reward -torch.sum(torch.abs(scores - true_tensor)) * cfg.LISTENER.GAP_COEF / (len(predicted_scores) - 1)                    
+                print('Score matrix:', score_matrix)
+                score_matrix = score_matrix.to(device)
+                # fill loss matrix
+                loss_matrix = torch.zeros( (2, images.size(0), images.size(0)), device=device)
+                # sg centered scores
+                for true_index in range(loss_matrix.size(1)):
+                    row_score = score_matrix[true_index]
+                    (true_scores, predicted_scores, binary) = format_scores(row_score, true_index, device)
+                    loss_vec = listener_loss_func(true_scores, predicted_scores, binary)
+                    loss_matrix[0][true_index] = loss_vec
+                # image centered scores
+                transposted_score_matrix = score_matrix.t()
+                for true_index in range(loss_matrix.size(1)):
+                    row_score = transposted_score_matrix[true_index]
+                    (true_scores, predicted_scores, binary) = format_scores(row_score, true_index, device)
+                    loss_vec = listener_loss_func(true_scores, predicted_scores, binary)
+                    loss_matrix[1][true_index] = loss_vec
 
 
+                
+                sg_acc = 0
+                img_acc = 0
+                # calculate accuracy
+                for i in range(loss_matrix.size(1)):
+                    temp_sg_acc = 0
+                    temp_img_acc = 0
+                    for j in range(loss_matrix.size(2)):
+                        if loss_matrix[0][i][i] > loss_matrix[0][i][j]:
+                            temp_sg_acc += 1
+                        if loss_matrix[1][i][i] > loss_matrix[1][j][i]:
+                            temp_img_acc += 1
 
-                    avg_acc += acc
+                    temp_sg_acc = temp_sg_acc*100/(loss_matrix.size(1)-1)
+                    temp_img_acc = temp_img_acc*100/(loss_matrix.size(1)-1)
+                    sg_acc += temp_sg_acc
+                    img_acc += temp_img_acc
 
-                avg_acc /= len(sgs)
+                sg_acc /= loss_matrix.size(1)
+                img_acc /= loss_matrix.size(1)
 
-                avg_acc = torch.tensor([avg_acc]).to(device)
+                avg_sg_acc = torch.tensor([sg_acc]).to(device)
+                avg_img_acc = torch.tensor([img_acc]).to(device)
                 # reduce acc over all gpus
-                avg_acc = {'acc' : avg_acc}
+                avg_acc = {'sg_acc' : avg_sg_acc, 'img_acc' : avg_img_acc}
                 avg_acc_reduced = reduce_loss_dict(avg_acc)
-                avg_acc_reduced = sum(acc for acc in avg_acc_reduced.values())
+                
+                sg_acc = sum(acc for acc in avg_acc_reduced['sg_acc'])
+                img_acc = sum(acc for acc in avg_acc_reduced['img_acc'])
+                
                 # log acc to wadb
                 if is_main_process():
-                    wandb.log({"Train Accuracy": avg_acc_reduced.item()})
-
-                listener_loss /= len(sgs)
-                if num_correct != 0:
-                    gap_reward /= num_correct
-                listener_loss *= cfg.LISTENER.LOSS_COEF
-                listener_loss += gap_reward
+                    wandb.log({"Train SG Accuracy": sg_acc.item()})
+                    wandb.log({"Train IMG Accuracy": img_acc.item()})
                 
-                listener_loss = listener_loss.to(device)
+                
+                sg_loss = 0
+                img_loss = 0
+
+                for i in range(loss_matrix.size(0)):
+                    for j in range(loss_matrix.size(1)):
+                        loss_matrix[i][j][j] = 0.
+                        
+                for i in range(loss_matrix.size(1)):
+                    sg_loss += torch.max(loss_matrix[0][i])
+                    img_loss += torch.max(loss_matrix[1][:][i])
+                        
+                sg_loss = sg_loss / loss_matrix.size(1)
+                img_loss = img_loss / loss_matrix.size(1)
+                sg_loss = sg_loss.to(device)
+                img_loss = img_loss.to(device)
+
                 loss_dict = {
-                    'LISTENER_LOSS' : listener_loss
+                    'sg_loss' : sg_loss,
+                    'img_loss' : img_loss
                 }
 
                 losses = sum(loss for loss in loss_dict.values())
 
                 # reduce losses over all GPUs for logging purposes
                 loss_dict_reduced = reduce_loss_dict(loss_dict)
-                losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+                sg_loss_reduced = loss_dict_reduced['sg_loss']
+                img_loss_reduced = loss_dict_reduced['img_loss']
                 if is_main_process():
-                    wandb.log({"Train Loss": losses_reduced})
+                    wandb.log({"Train SG Loss": sg_loss_reduced})
+                    wandb.log({"Train IMG Loss": img_loss_reduced})
+                
+                losses_reduced = sum(loss for loss in loss_dict_reduced.values())
                 meters.update(loss=losses_reduced, **loss_dict_reduced)
+
+
+            
 
                 listener_optimizer.zero_grad()
                 # Note: If mixed precision is not used, this ends up doing nothing
                 # Otherwise apply loss scaling for mixed-precision recipe
 
-                losses_reduced.backward()
+                losses.backward()
                 #with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
                 #    scaled_losses.backward()
                 
+
+
                 verbose = (iteration % cfg.SOLVER.PRINT_GRAD_FREQ) == 0 or print_first_grad # print grad or not
                 print_first_grad = False
                 #clip_grad_value([(n, p) for n, p in listener.named_parameters() if p.requires_grad], cfg.LISTENER.CLIP_VALUE, logger=logger, verbose=True, clip=True)

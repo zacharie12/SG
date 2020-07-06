@@ -19,7 +19,7 @@ class SimpleGNN(Gnn):
         super(SimpleGNN, self).__init__()
         self.conv1 = CGConv(in_channels, dim, aggr='add', bias=True)
         self.conv2 = CGConv(in_channels, dim,  aggr='add', bias=True)
-
+        self.conv3 = CGConv(in_channels, dim, aggr='add', bias=True)
         self.lin = nn.Linear(in_channels, out_size)
 
     def forward(self, sg):
@@ -29,9 +29,10 @@ class SimpleGNN(Gnn):
         N = len(x)
         x = self.conv1(x, edge_idx, edge_w)
         x = F.relu(x)
-        x = F.dropout(x, training=self.training)
+        #x = F.dropout(x, training=self.training)
         x = self.conv2(x, edge_idx, edge_w)
-        device = x.get_device()
+        x = F.relu(x)
+        x=self.conv3(x, edge_idx, edge_w)
         device = x.get_device()
         batch = torch.zeros((N), dtype=torch.long, device=device)
         x = global_mean_pool(x, batch)
