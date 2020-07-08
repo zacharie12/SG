@@ -165,7 +165,9 @@ def train(cfg, local_rank, distributed, logger):
 
     if cfg.SOLVER.PRE_VAL:
         logger.info("Validate before training")
-        #(loss_val, acc) =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+        #output =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+        #print('OUTPUT: ', output)
+        #(sg_loss, img_loss, sg_acc, img_acc) = output
 
     logger.info("Start training")
     meters = MetricLogger(delimiter="  ")
@@ -182,7 +184,7 @@ def train(cfg, local_rank, distributed, logger):
     while True:
         try:
             for iteration, (images, targets, _) in enumerate(train_data_loader, start_iter):
-                print(f'ITERATION NUMBER: {iteration}')
+                #print(f'ITERATION NUMBER: {iteration}')
                 if any(len(target) < 1 for target in targets):
                     logger.error(f"Iteration={iteration + 1} || Image Ids used for training {_} || targets Length={[len(target) for target in targets]}" )
                 if len(images) <= 1:
@@ -263,7 +265,7 @@ def train(cfg, local_rank, distributed, logger):
                     scores = listener(detached_sg, images)
                     score_matrix[true_index] = scores
 
-                print('Score matrix:', score_matrix)
+                #print('Score matrix:', score_matrix)
                 score_matrix = score_matrix.to(device)
                 # fill loss matrix
                 loss_matrix = torch.zeros( (2, images.size(0), images.size(0)), device=device)
@@ -314,8 +316,10 @@ def train(cfg, local_rank, distributed, logger):
                 
                 # log acc to wadb
                 if is_main_process():
-                    wandb.log({"Train SG Accuracy": sg_acc.item()})
-                    wandb.log({"Train IMG Accuracy": img_acc.item()})
+                    wandb.log({
+                        "Train SG Accuracy": sg_acc.item(),
+                        "Train IMG Accuracy": img_acc.item()
+                    })
                 
                 
                 sg_loss = 0
@@ -405,10 +409,17 @@ def train(cfg, local_rank, distributed, logger):
                 if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
                     logger.info("Start validating")
                     val_result = run_val(cfg, model, listener, val_data_loaders, distributed, logger)
-                    (val_loss, val_acc) = val_result
+                    print('Validation output: ', val_result)
+                    (sg_loss, img_loss, sg_acc, img_acc) = val_result
+                    
                     if is_main_process():
-                        wandb.log({"Validation Loss": val_loss})
-                        wandb.log({"Validation Accuracy": val_acc})
+                        wandb.log({
+                            "Validation SG Accuracy": sg_acc,
+                            "Validation IMG Accuracy": img_acc,
+                            "Validation SG Loss": sg_loss,
+                            "Validation IMG Loss": img_loss,
+                        })
+                        
                     logger.info("Validation Result: %.4f" % val_result)
         except:
             train_data_loader = make_data_loader(
@@ -451,6 +462,7 @@ def run_val(cfg, model, listener, val_data_loaders, distributed, logger):
     dataset_names = cfg.DATASETS.VAL
     val_result = []
     for dataset_name, val_data_loader in zip(dataset_names, val_data_loaders):
+        
         dataset_result = listener_inference(
                             cfg,
                             model,
@@ -468,9 +480,8 @@ def run_val(cfg, model, listener, val_data_loaders, distributed, logger):
         synchronize()
         if type(dataset_result) is not tuple:
             dataset_result = (dataset_result,)
-
         val_result.append(dataset_result)
-    
+
     organized_result = [[val_result[i][j] for i in range(len(val_result))] for j in range(len(val_result[0]))]
     final_result = []
     for i in range(len(organized_result)):

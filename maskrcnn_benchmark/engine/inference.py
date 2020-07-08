@@ -65,8 +65,12 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
     cpu_device = torch.device("cpu")
     torch.cuda.empty_cache()
     for _, batch in enumerate(tqdm(data_loader)):
+
+
         with torch.no_grad():
             images, targets, image_ids = batch
+            if len(images) <= 1:
+                continue
 
             images_list = deepcopy(images)
             #images_list = to_image_list(images_list, cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
@@ -137,6 +141,8 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
                         if loss_matrix[1][i][i] > loss_matrix[1][j][i]:
                             temp_img_acc += 1
 
+
+            
                     temp_sg_acc = temp_sg_acc*100/(loss_matrix.size(1)-1)
                     temp_img_acc = temp_img_acc*100/(loss_matrix.size(1)-1)
 
@@ -170,7 +176,7 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
             synchronize()
             multi_gpu_predictions = all_gather({img_id: (sg_loss_i, img_loss_i, sg_acc_i, img_acc_i) \
                                     for img_id, sg_loss_i, img_loss_i, sg_acc_i, img_acc_i \
-                                    in  zip(image_ids, sg_loss, img_loss, sg_acc, img_Acc)})
+                                    in  zip(image_ids, sg_loss, img_loss, sg_acc, img_acc)})
 
             if is_main_process():
                 for p in multi_gpu_predictions:
@@ -332,10 +338,12 @@ def listener_inference(
 
     if not load_prediction_from_cache:
         predictions = _accumulate_predictions_from_multiple_gpus(predictions, synchronize_gather=cfg.TEST.RELATION.SYNC_GATHER)
+    
+
 
     if not is_main_process():
-        return -1.0
-
+        return tuple([-1., -1., -1., -1.])
+    
     #if output_folder is not None and not load_prediction_from_cache:
     #    torch.save(predictions, os.path.join(output_folder, "predictions.pth"))
 
@@ -347,13 +355,12 @@ def listener_inference(
     )
 
     predictions = [[predictions[i][j] for i in range(len(predictions))] for j in range(len(predictions[0]))]
-    print('Predictions: ', predictions, len(predictions))
-    
+
     output_list = []
     for i, result in enumerate(predictions):
         out_sum = sum(result)
-        out_sum = out_sum / (len(predictions[i]) 
+        out_sum = out_sum / len(predictions[i]) 
         output_list.append(out_sum)
     
-    return output_list
+    return tuple(output_list)
 
