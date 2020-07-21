@@ -69,6 +69,15 @@ class VGDataset(torch.utils.data.Dataset):
         self.filenames = [self.filenames[i] for i in np.where(self.split_mask)[0]]
         self.img_info = [self.img_info[i] for i in np.where(self.split_mask)[0]]
 
+        '''
+        save filenames after split to file
+        
+        if self.split == 'train':
+            with open('filenames_masked', 'w') as f:
+                for name in self.filenames:
+                    f.write(name + '\n')
+
+        '''
     def __getitem__(self, index):
         #if self.split == 'train':
         #    while(random.random() > self.img_info[index]['anti_prop']):

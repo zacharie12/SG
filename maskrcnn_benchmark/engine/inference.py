@@ -8,7 +8,7 @@ from tqdm import tqdm
 from maskrcnn_benchmark.config import cfg
 from maskrcnn_benchmark.data.datasets.evaluation import evaluate
 from maskrcnn_benchmark.structures.image_list import to_image_list
-from ..utils.comm import is_main_process, get_world_size
+from ..utils.comm import is_main_process, get_world_size, get_rank
 from ..utils.comm import all_gather
 from ..utils.comm import synchronize
 from ..utils.timer import Timer, get_time_str
@@ -64,128 +64,157 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
     listener_loss_func = torch.nn.MarginRankingLoss(margin=1, reduction='none')
     cpu_device = torch.device("cpu")
     torch.cuda.empty_cache()
+    sg_loss_dict = {}
+    sg_acc_dict = {}
+    img_loss_dict = {}
+    img_acc_dict = {}
     for _, batch in enumerate(tqdm(data_loader)):
-
-
         with torch.no_grad():
             images, targets, image_ids = batch
-            if len(images) <= 1:
-                continue
+            
+            if len(images) > 1:
 
-            images_list = deepcopy(images)
-            #images_list = to_image_list(images_list, cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
+                images_list = deepcopy(images)
+                #images_list = to_image_list(images_list, cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
 
-            for i in range(len(images)):
-                images[i] = images[i].unsqueeze(0)
-                images[i] = F.interpolate(images[i], size=(224, 224), mode='bilinear', align_corners=False)
-                images[i] = images[i].squeeze()
+                for i in range(len(images)):
+                    images[i] = images[i].unsqueeze(0)
+                    images[i] = F.interpolate(images[i], size=(224, 224), mode='bilinear', align_corners=False)
+                    images[i] = images[i].squeeze()
 
-            images = torch.stack(images).to(device)
+                images = torch.stack(images).to(device)
 
-            targets = [target.to(device) for target in targets]
-            if timer:
-                timer.tic()
-            if cfg.TEST.BBOX_AUG.ENABLED:
-                output = im_detect_bbox_aug(model, images, device)
+                targets = [target.to(device) for target in targets]
+                if timer:
+                    timer.tic()
+                if cfg.TEST.BBOX_AUG.ENABLED:
+                    output = im_detect_bbox_aug(model, images, device)
+                else:
+                    output=[]
+                    # relation detection needs the targets
+                    sgs=[]
+                    for i in range(len(images_list)):
+                        model_input = to_image_list(images_list[i], cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
+                        sg = model.forward(model_input, [targets[i]], ret_sg=True)
+                        sgs.append(sg)
+                    
+                    sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
+
+                    accuracy = []
+                    listener_loss = 0
+
+                    score_matrix = torch.zeros( (images.size(0), images.size(0)) )
+                    # fill score matrix
+                    for true_index, sg in enumerate(sgs):
+                        acc = 0
+                        detached_sg = (sg[0].detach().requires_grad_(), sg[1], sg[2].detach().requires_grad_() )
+                        #scores = listener(sg, images)
+                        scores = listener(detached_sg, images)
+                        score_matrix[true_index] = scores
+
+                    score_matrix = score_matrix.to(device)
+
+                    # fill loss matrix
+                    loss_matrix = torch.zeros( (2, images.size(0), images.size(0)), device=device)
+                    # sg centered scores
+                    for true_index in range(loss_matrix.size(1)):
+                        row_score = score_matrix[true_index]
+                        (true_scores, predicted_scores, binary) = format_scores(row_score, true_index, device)
+                        loss_vec = listener_loss_func(true_scores, predicted_scores, binary)
+                        loss_matrix[0][true_index] = loss_vec
+                    # image centered scores
+                    transposted_score_matrix = score_matrix.t()
+                    for true_index in range(loss_matrix.size(1)):
+                        row_score = transposted_score_matrix[true_index]
+                        (true_scores, predicted_scores, binary) = format_scores(row_score, true_index, device)
+                        loss_vec = listener_loss_func(true_scores, predicted_scores, binary)
+                        loss_matrix[1][true_index] = loss_vec
+
+
+                    sg_acc = []
+                    img_acc = []
+                    # calculate accuracy
+                    for i in range(loss_matrix.size(1)):
+                        temp_sg_acc = 0
+                        temp_img_acc = 0
+                        for j in range(loss_matrix.size(2)):
+                            if loss_matrix[0][i][i] > loss_matrix[0][i][j]:
+                                temp_sg_acc += 1
+                            if loss_matrix[1][i][i] > loss_matrix[1][j][i]:
+                                temp_img_acc += 1
+
+
+                
+                        temp_sg_acc = temp_sg_acc*100/(loss_matrix.size(1)-1)
+                        temp_img_acc = temp_img_acc*100/(loss_matrix.size(1)-1)
+
+                        sg_acc.append(temp_sg_acc)
+                        img_acc.append(temp_img_acc)
+
+                    for i in range(loss_matrix.size(0)):
+                        for j in range(loss_matrix.size(1)):
+                            loss_matrix[i][j][j] = 0.
+
+                    sg_loss = []
+                    img_loss = []
+                    for i in range(loss_matrix.size(1)):
+                        sg_loss.append(torch.max(loss_matrix[0][i]))
+                        img_loss.append(torch.max(loss_matrix[1][:][i]))
+
+                if timer:
+                    if not cfg.MODEL.DEVICE == 'cpu':
+                        torch.cuda.synchronize()
+                    timer.toc()
+                sg_loss = [o.to(cpu_device) for o in sg_loss]
+                img_loss = [o.to(cpu_device) for o in img_loss]
+                
+                sg_acc = [torch.Tensor([acc]).to(cpu_device) for acc in sg_acc]
+                img_acc = [torch.Tensor([acc]).to(cpu_device) for acc in img_acc]
+                
+                sg_loss_dict = {img_id: sg_loss_i for img_id, sg_loss_i in zip(image_ids, sg_loss)}
+                sg_acc_dict = {img_id: sg_acc_i for img_id, sg_acc_i in zip(image_ids, sg_acc)}
+                img_loss_dict = {img_id: img_loss_i for img_id, img_loss_i in zip(image_ids, img_loss)}
+                img_acc_dict = {img_id: img_acc_i for img_id, img_acc_i in zip(image_ids, img_acc)}
             else:
-                output=[]
-                # relation detection needs the targets
-                sgs=[]
-                for i in range(len(images_list)):
-                    model_input = to_image_list(images_list[i], cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
-                    sg = model.forward(model_input, [targets[i]], ret_sg=True)
-                    sgs.append(sg)
-                
-                sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
+                sg_loss_dict = {}
+                sg_acc_dict = {}
+                img_loss_dict = {}
+                img_acc_dict = {}
 
-                accuracy = []
-                listener_loss = 0
-
-                score_matrix = torch.zeros( (images.size(0), images.size(0)) )
-                # fill score matrix
-                for true_index, sg in enumerate(sgs):
-                    acc = 0
-                    detached_sg = (sg[0].detach().requires_grad_(), sg[1], sg[2].detach().requires_grad_() )
-                    #scores = listener(sg, images)
-                    scores = listener(detached_sg, images)
-                    score_matrix[true_index] = scores
-
-                score_matrix = score_matrix.to(device)
-
-                # fill loss matrix
-                loss_matrix = torch.zeros( (2, images.size(0), images.size(0)), device=device)
-                # sg centered scores
-                for true_index in range(loss_matrix.size(1)):
-                    row_score = score_matrix[true_index]
-                    (true_scores, predicted_scores, binary) = format_scores(row_score, true_index, device)
-                    loss_vec = listener_loss_func(true_scores, predicted_scores, binary)
-                    loss_matrix[0][true_index] = loss_vec
-                # image centered scores
-                transposted_score_matrix = score_matrix.t()
-                for true_index in range(loss_matrix.size(1)):
-                    row_score = transposted_score_matrix[true_index]
-                    (true_scores, predicted_scores, binary) = format_scores(row_score, true_index, device)
-                    loss_vec = listener_loss_func(true_scores, predicted_scores, binary)
-                    loss_matrix[1][true_index] = loss_vec
-
-
-                sg_acc = []
-                img_acc = []
-                # calculate accuracy
-                for i in range(loss_matrix.size(1)):
-                    temp_sg_acc = 0
-                    temp_img_acc = 0
-                    for j in range(loss_matrix.size(2)):
-                        if loss_matrix[0][i][i] > loss_matrix[0][i][j]:
-                            temp_sg_acc += 1
-                        if loss_matrix[1][i][i] > loss_matrix[1][j][i]:
-                            temp_img_acc += 1
-
-
-            
-                    temp_sg_acc = temp_sg_acc*100/(loss_matrix.size(1)-1)
-                    temp_img_acc = temp_img_acc*100/(loss_matrix.size(1)-1)
-
-                    sg_acc.append(temp_sg_acc)
-                    img_acc.append(temp_img_acc)
-
-                for i in range(loss_matrix.size(0)):
-                    for j in range(loss_matrix.size(1)):
-                        loss_matrix[i][j][j] = 0.
-
-                sg_loss = []
-                img_loss = []
-                for i in range(loss_matrix.size(1)):
-                    sg_loss.append(torch.max(loss_matrix[0][i]))
-                    img_loss.append(torch.max(loss_matrix[1][:][i]))
-
-                
-
-
-            if timer:
-                if not cfg.MODEL.DEVICE == 'cpu':
-                    torch.cuda.synchronize()
-                timer.toc()
-            sg_loss = [o.to(cpu_device) for o in sg_loss]
-            img_loss = [o.to(cpu_device) for o in img_loss]
-            
-            sg_acc = [torch.Tensor([acc]).to(cpu_device) for acc in sg_acc]
-            img_acc = [torch.Tensor([acc]).to(cpu_device) for acc in img_acc]
-            
         if synchronize_gather:
             synchronize()
-            multi_gpu_predictions = all_gather({img_id: (sg_loss_i, img_loss_i, sg_acc_i, img_acc_i) \
+            '''
+            gather_dict = {img_id: (sg_loss_i, img_loss_i, sg_acc_i, img_acc_i) \
                                     for img_id, sg_loss_i, img_loss_i, sg_acc_i, img_acc_i \
-                                    in  zip(image_ids, sg_loss, img_loss, sg_acc, img_acc)})
+                                    in  zip(image_ids, sg_loss, img_loss, sg_acc, img_acc)}
+            
+            multi_gpu_predictions = all_gather(gather_dict)
+            '''
+            def merge_dicts(dict_list):
+                if not dict_list:
+                    return dict_list
+
+                result = {}
+                for d in dict_list:
+                    result.update(d)
+
+                return result
+
+            sg_loss_gather = merge_dicts(all_gather(sg_loss_dict))
+            sg_acc_gather = merge_dicts(all_gather(sg_acc_dict))
+            img_loss_gather = merge_dicts(all_gather(img_loss_dict))
+            img_acc_gather = merge_dicts(all_gather(img_acc_dict))
 
             if is_main_process():
-                for p in multi_gpu_predictions:
-                    results_dict.update(p)
+                multi_gpu_predictions = {img_id: (sg_loss_gather[img_id], sg_acc_gather[img_id], img_loss_gather[img_id], img_acc_gather[img_id]) \
+                                        for img_id in image_ids}
+                results_dict.update(multi_gpu_predictions)
+
         else:
             results_dict.update(
                 {img_id: (sg_loss_i, img_loss_i, sg_acc_i, img_acc_i) \
                 for img_id, sg_loss_i, img_loss_i, sg_acc_i, img_acc_i \
-                in  zip(image_ids, sg_loss, img_loss, sg_acc, img_Acc)}
+                in  zip(image_ids, sg_loss, img_loss, sg_acc, img_acc)}
             )
     torch.cuda.empty_cache()
     return results_dict
@@ -319,6 +348,7 @@ def listener_inference(
     else:
         predictions = compute_listener_on_dataset(model, listener, data_loader, device, synchronize_gather=cfg.TEST.RELATION.SYNC_GATHER, timer=inference_timer)
     # wait for all processes to complete before measuring the time
+
     synchronize()
     total_time = total_timer.toc()
     total_time_str = get_time_str(total_time)
@@ -339,7 +369,6 @@ def listener_inference(
     if not load_prediction_from_cache:
         predictions = _accumulate_predictions_from_multiple_gpus(predictions, synchronize_gather=cfg.TEST.RELATION.SYNC_GATHER)
     
-
 
     if not is_main_process():
         return tuple([-1., -1., -1., -1.])

@@ -11,7 +11,7 @@ import datetime
 import os
 import time
 from copy import deepcopy
-
+import GPUtil
 import PIL
 import torch
 import torch.nn.functional as F
@@ -21,7 +21,7 @@ import torchvision
 # and enable mixed-precision via apex.amp
 import wandb
 from PIL import Image
-from pytorch_memlab import profile
+from pytorch_memlab import profile, MemReporter
 from torch.nn.utils import clip_grad_norm_
 from torchvision import transforms
 
@@ -60,6 +60,7 @@ def train(cfg, local_rank, distributed, logger):
     if is_main_process():
         wandb.init(project='scene-graph', entity='sgg-speaker-listener', config=cfg.LISTENER)
     debug_print(logger, 'prepare training')
+
     model = build_detection_model(cfg)
     listener = build_listener(cfg)
     if is_main_process():
@@ -92,6 +93,7 @@ def train(cfg, local_rank, distributed, logger):
     device = torch.device(cfg.MODEL.DEVICE)
     model.to(device)
     listener.to(device)
+
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     num_batch = cfg.SOLVER.IMS_PER_BATCH
     optimizer = make_optimizer(cfg, model, logger, slow_heads=slow_heads, slow_ratio=10.0, rl_factor=float(num_batch))
@@ -106,7 +108,6 @@ def train(cfg, local_rank, distributed, logger):
     model, optimizer = amp.initialize(model, optimizer, opt_level=amp_opt_level)
 
     listener.float()
-
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank,
@@ -120,7 +121,8 @@ def train(cfg, local_rank, distributed, logger):
             # this should be removed if we update BatchNorm stats
             broadcast_buffers=False,
             find_unused_parameters=True,
-        ) 
+        )
+
     debug_print(logger, 'end distributed')
     arguments = {}
     arguments["iteration"] = 0
@@ -131,9 +133,11 @@ def train(cfg, local_rank, distributed, logger):
     checkpointer = DetectronCheckpointer(
         cfg, model, optimizer, scheduler, output_dir, save_to_disk, custom_scheduler=True
     )
+
     listener_checkpointer = Checkpointer(
         listener, listener_optimizer, listener_scheduler, listener_dir, save_to_disk, custom_scheduler=False
     )
+
     # if there is certain checkpoint in output_dir, load it, else load pretrained detector
     if listener_checkpointer.has_checkpoint():
         extra_listener_checkpoint_data = listener_checkpointer.load('')
@@ -160,6 +164,7 @@ def train(cfg, local_rank, distributed, logger):
         is_distributed=distributed,
         ret_images=True
     )
+
     debug_print(logger, 'end dataloader')
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
 
@@ -180,10 +185,12 @@ def train(cfg, local_rank, distributed, logger):
 
     listener_loss_func = torch.nn.MarginRankingLoss(margin=1, reduction='none')
     #reg_loss = torch.nn.MSELoss(reduction='none')
-
+    is_printed = False
     while True:
         try:
-            for iteration, (images, targets, _) in enumerate(train_data_loader, start_iter):
+            for iteration, (images, targets, image_ids) in enumerate(train_data_loader, start_iter):
+                listener_optimizer.zero_grad()
+
                 #print(f'ITERATION NUMBER: {iteration}')
                 if any(len(target) < 1 for target in targets):
                     logger.error(f"Iteration={iteration + 1} || Image Ids used for training {_} || targets Length={[len(target) for target in targets]}" )
@@ -193,27 +200,26 @@ def train(cfg, local_rank, distributed, logger):
                 data_time = time.time() - end
                 iteration = iteration + 1
                 arguments["iteration"] = iteration
-
                 model.train()
                 fix_eval_modules(eval_modules)
-
                 images_list = deepcopy(images)
                 images_list = to_image_list(images_list, cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
+               
+                #SAVE IMAGE TO PC
 
                 '''
-                SAVE IMAGE TO PC
-                is_printed = False
                 if is_main_process():
                     if not is_printed:
                         transform = transforms.ToPILImage()
                         print('SAVING IMAGE')
-                        img = transform(images[0])
+                        img = transform(images[2])
                         print('DONE TRANSFORM')
-                        img.save('img.png')
+                        img.save('img3.png')
                         print('DONE SAVING IMAGE')
+                        print('ids ', image_ids[2])
                         is_printed = True
-                '''
-                '''
+                
+                
                 transform = transforms.Compose([
                     transforms.ToPILImage(),
                     #transforms.Resize((cfg.LISTENER.IMAGE_SIZE, cfg.LISTENER.IMAGE_SIZE)),
@@ -233,11 +239,11 @@ def train(cfg, local_rank, distributed, logger):
                 targets = [target.to(device) for target in targets]
 
                 #print('IMAGE BEFORE Model: ', images[0], 'GPU: ', get_rank())
-
                 _, sgs = model(images_list, targets)
 
                 #print('IMAGE AFTER Model: ', images)
-                '''is_printed = False
+                '''
+                is_printed = False
                 if is_main_process():
                     if not is_printed:
                         print('PRINTING OBJECTS')
@@ -246,9 +252,9 @@ def train(cfg, local_rank, distributed, logger):
                         for i in range(obj.size(0)):
                             print(f'OBJECT {i}: ', obj[i])
                         print('DONE PRINTING OBJECTS')
-                        is_printed=True'''
+                        is_printed=True
 
-                
+                '''
                 image_list = None
                 sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
 
@@ -284,7 +290,7 @@ def train(cfg, local_rank, distributed, logger):
                     loss_matrix[1][true_index] = loss_vec
 
 
-                
+                print('iteration:', iteration)
                 sg_acc = 0
                 img_acc = 0
                 # calculate accuracy
@@ -295,7 +301,7 @@ def train(cfg, local_rank, distributed, logger):
                         if loss_matrix[0][i][i] > loss_matrix[0][i][j]:
                             temp_sg_acc += 1
                         if loss_matrix[1][i][i] > loss_matrix[1][j][i]:
-                            temp_img_acc += 1
+                            temp_img_acc += 1  
 
                     temp_sg_acc = temp_sg_acc*100/(loss_matrix.size(1)-1)
                     temp_img_acc = temp_img_acc*100/(loss_matrix.size(1)-1)
@@ -359,10 +365,9 @@ def train(cfg, local_rank, distributed, logger):
 
             
 
-                listener_optimizer.zero_grad()
+                
                 # Note: If mixed precision is not used, this ends up doing nothing
                 # Otherwise apply loss scaling for mixed-precision recipe
-
                 losses.backward()
                 #with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
                 #    scaled_losses.backward()
@@ -409,7 +414,6 @@ def train(cfg, local_rank, distributed, logger):
                 if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
                     logger.info("Start validating")
                     val_result = run_val(cfg, model, listener, val_data_loaders, distributed, logger)
-                    print('Validation output: ', val_result)
                     (sg_loss, img_loss, sg_acc, img_acc) = val_result
                     
                     if is_main_process():

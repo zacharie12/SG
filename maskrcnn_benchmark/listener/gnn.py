@@ -2,7 +2,8 @@ from abc import ABC
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import CGConv, GMMConv, GlobalAttention, global_mean_pool
+from torch_scatter import scatter_mean
+from torch_geometric.nn import CGConv, GMMConv, GlobalAttention, global_mean_pool,  MetaLayer
 from math import sqrt
 
 
@@ -275,18 +276,178 @@ class EAGNN(Gnn):
         x = global_mean_pool(x, batch)
         return x
 
-GNN_ARCHITECHTURE = {'SimpleGNN':SimpleGNN, 'GaussGNN':GaussGNN, 'AGNN':AGNN, 'EAGNN':EAGNN }
+
+
+
+class EdgeModel(torch.nn.Module):
+    def __init__(self, node_in, edge_in, node_out, edge_out, global_dim):
+        super(EdgeModel, self).__init__()
+        self.edge_mlp = nn.Sequential (
+            nn.Linear(2*node_in + edge_in + global_dim, edge_out),
+            nn.ReLU(),
+            nn.Linear(edge_out, edge_out)
+        )
+
+    def forward(self, src, dest, edge_attr, u, batch):
+        # source, target: [E, F_x], where E is the number of edges.
+        # edge_attr: [E, F_e]
+        # u: [B, F_u], where B is the number of graphs.
+        # batch: [E] with max entry B - 1.
+        out = torch.cat([src, dest, edge_attr, u[batch]], 1)
+        return self.edge_mlp(out)
+        
+class EdgeModel_input(torch.nn.Module):
+    def __init__(self, node_in, edge_in, node_out, edge_out, global_dim):
+        super(EdgeModel_input, self).__init__()
+        self.edge_mlp = nn.Sequential (
+            nn.Linear(2*node_in + edge_in, edge_out),
+            nn.ReLU(),
+            nn.Linear(edge_out, edge_out)
+        )
+
+    def forward(self, src, dest, edge_attr, u, batch):
+        # source, target: [E, F_x], where E is the number of edges.
+        # edge_attr: [E, F_e]
+        # u: [B, F_u], where B is the number of graphs.
+        # batch: [E] with max entry B - 1.
+        out = torch.cat([src, dest, edge_attr], 1)
+        return self.edge_mlp(out)
+        
+
+class NodeModel(torch.nn.Module):
+    def __init__(self, node_in, edge_in, node_out, edge_out, global_dim):
+        super(NodeModel, self).__init__()
+        self.node_mlp_1  = nn.Sequential (
+            nn.Linear(node_in + edge_out, node_out),
+            nn.ReLU(),
+            nn.Linear(node_out, node_out)
+        )
+
+        self.node_mlp_2 = nn.Sequential (
+            nn.Linear(global_dim + node_in + node_out, node_out),
+            nn.ReLU(),
+            nn.Linear(node_out, node_out)
+        )
+
+    def forward(self, x, edge_index, edge_attr, u, batch):
+        # x: [N, F_x], where N is the number of nodes.
+        # edge_index: [2, E] with max entry N - 1.
+        # edge_attr: [E, F_e]
+        # u: [B, F_u]
+        # batch: [N] with max entry B - 1.
+        row, col = edge_index
+        out = torch.cat([x[row], edge_attr], dim=1)
+        out = self.node_mlp_1(out)
+        out = scatter_mean(out, col, dim=0, dim_size=x.size(0))
+        out = torch.cat([x, out, u[batch]], dim=1)
+        return self.node_mlp_2(out)
+
+class NodeModel_input(torch.nn.Module):
+    def __init__(self, node_in, edge_in, node_out, edge_out, global_dim):
+        super(NodeModel_input, self).__init__()
+        self.node_mlp_1  = nn.Sequential (
+            nn.Linear(node_in + edge_out, node_out),
+            nn.ReLU(),
+            nn.Linear(node_out, node_out)
+        )
+
+        self.node_mlp_2 = nn.Sequential (
+            nn.Linear(node_in + node_out, node_out),
+            nn.ReLU(),
+            nn.Linear(node_out, node_out)
+        )
+
+    def forward(self, x, edge_index, edge_attr, u, batch):
+        # x: [N, F_x], where N is the number of nodes.
+        # edge_index: [2, E] with max entry N - 1.
+        # edge_attr: [E, F_e]
+        # u: [B, F_u]
+        # batch: [N] with max entry B - 1.
+        row, col = edge_index
+        out = torch.cat([x[row], edge_attr], dim=1)
+        out = self.node_mlp_1(out)
+        out = scatter_mean(out, col, dim=0, dim_size=x.size(0))
+        out = torch.cat([x, out], dim=1)
+        return self.node_mlp_2(out)
+
+class GlobalModel(torch.nn.Module):
+    def __init__(self, node_in, edge_in, node_out, edge_out, global_dim):
+        super(GlobalModel, self).__init__()
+        self.global_mlp = nn.Sequential (
+            nn.Linear(global_dim + node_out, global_dim),
+            nn.ReLU(),
+            nn.Linear(global_dim, global_dim)
+        )
+
+    def forward(self, x, edge_index, edge_attr, u, batch):
+        # x: [N, F_x], where N is the number of nodes.
+        # edge_index: [2, E] with max entry N - 1.
+        # edge_attr: [E, F_e]
+        # u: [B, F_u]
+        # batch: [N] with max entry B - 1.
+        out = torch.cat([u, scatter_mean(x, batch, dim=0)], dim=1)
+        return self.global_mlp(out)
+
+'''
+class ChanneledMetaLayer():
+    def __init__(self, num_channels=5, **kwargs):
+        self.num_channels = num_channels
+        self.layers = [MetaLayer(kwargs) for _ in range(num_channels)]
+
+    def forward(*args):
+
+        results = [layer(args) for layer in layers]
+'''
+
+class MetaGNN(torch.nn.Module):
+    def __init__(self, node_in, edge_in, global_dim):
+        super(MetaGNN, self).__init__()
+        node_out = global_dim
+        edge_out = global_dim
+        self.global_dim = global_dim
+        self.conv1 = MetaLayer(EdgeModel_input(node_in, edge_in, node_out, edge_out, global_dim), NodeModel_input(node_in, edge_in, node_out, edge_out, global_dim), GlobalModel(node_in, edge_in, node_out, edge_out, global_dim))
+        self.conv2 = MetaLayer(EdgeModel(node_out, edge_out, node_out, edge_out, global_dim), NodeModel(node_out, edge_out, node_out, edge_out, global_dim), GlobalModel(node_out, edge_out, node_out, edge_out, global_dim))
+        self.conv3 = MetaLayer(EdgeModel(node_out, edge_out, node_out, edge_out, global_dim), NodeModel(node_out, edge_out, node_out, edge_out, global_dim), GlobalModel(node_out, edge_out, node_out, edge_out, global_dim))
+        self.linear = nn.Linear(global_dim, global_dim)
+        
+        def init_weights(m):
+            if type(m) == nn.Linear:
+        #        torch.nn.init.kaiming_normal_(m.weight)
+                m.bias.data.fill_(0.01)
+        self.apply(init_weights)
+        
+    def forward(self, sg):
+        x, edge_idx, edge_w = sg
+        E = edge_w
+        device = x.get_device()
+        N = len(x)
+        batch = torch.zeros((N,), dtype=torch.long, device=device)
+        global_vec = torch.normal(mean=0, std=0.01, size=(1,self.global_dim), device=device)
+        x, edge_w, global_vec = self.conv1(x, edge_idx, edge_w, global_vec, batch)
+        x, edge_w, global_vec = self.conv2(x, edge_idx, edge_w, global_vec, batch)
+        x, edge_w, global_vec = self.conv3(x, edge_idx, edge_w, global_vec, batch)
+        global_vec = self.linear(global_vec)
+        
+        return global_vec
+
+
+
+
+GNN_ARCHITECHTURE = {'SimpleGNN':SimpleGNN, 'GaussGNN':GaussGNN, 'AGNN':AGNN, 'EAGNN':EAGNN, 'MetaGNN':MetaGNN }
 def build_gnn(cfg):
     gnn = GNN_ARCHITECHTURE[cfg.LISTENER.GNN](cfg.LISTENER.NODE_SIZE, cfg.LISTENER.EDGE_SIZE, cfg.LISTENER.GNN_OUTPUT)
     return gnn
 
 if __name__ == '__main__':
-    gnn = SimpleGNN(1, 2, 4)
+    gnn = MetaGNN(1, 2, 4, 2, 5)
+    global_vec = torch.zeros((1,5))
+    batch = torch.zeros((4,), dtype=torch.long)
+    #gnn = SimpleGNN(1, 2, 4)
     x = torch.zeros((4, 1))
     y = torch.tensor([[0, 1, 1, 2],
                     [1, 0, 2, 3]], dtype=torch.long)
     w = torch.ones((4, 2))
-    output = gnn((x, y, w))
+    output = gnn((x,y,w))
     print(output)
 
 

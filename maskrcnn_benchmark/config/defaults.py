@@ -92,7 +92,8 @@ _C.DATALOADER.SIZE_DIVISIBILITY = 0
 # If True, each batch should contain only images for which the aspect ratio
 # is compatible. This groups portrait images together, and landscape images
 # are not batched with portrait images.
-_C.DATALOADER.ASPECT_RATIO_GROUPING = True
+# CHANGING THIS TO TRUE RUINS LISTENER TRAINING LOOP (IN VALIDATION)
+_C.DATALOADER.ASPECT_RATIO_GROUPING = False
 
 
 # ---------------------------------------------------------------------------- #
@@ -606,10 +607,10 @@ _C.LISTENER.GNN_OUTPUT = 200
 _C.LISTENER.LOSS_COEF = 1
 _C.LISTENER.GAP_COEF = 0
 _C.LISTENER.CNN = 'ResNet'
-_C.LISTENER.GNN = 'GaussGNN'
+_C.LISTENER.GNN = 'MetaGNN'
 _C.LISTENER.END = 'CosineDistance'
 
-_C.LISTENER.LR = 0.002 / 3
+_C.LISTENER.LR = 0.002 / 1  
 _C.LISTENER.WEIGHT_DECAY = 0
 _C.LISTENER.CLIP_VALUE = 0.5
 _C.LISTENER_DIR = "."
