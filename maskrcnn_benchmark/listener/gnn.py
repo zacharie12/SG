@@ -388,16 +388,27 @@ class GlobalModel(torch.nn.Module):
         out = torch.cat([u, scatter_mean(x, batch, dim=0)], dim=1)
         return self.global_mlp(out)
 
-'''
-class ChanneledMetaLayer():
-    def __init__(self, num_channels=5, **kwargs):
+
+class ChanneledMetaLayer(nn.Module):
+    def __init__(self, edge_model=None, node_model=None, global_model=None, num_channels=5):
+        super(ChanneledMetaLayer, self).__init__()
         self.num_channels = num_channels
-        self.layers = [MetaLayer(kwargs) for _ in range(num_channels)]
+        self.layers = [MetaLayer(edge_model, node_model, global_model) for _ in range(num_channels)]
 
-    def forward(*args):
-
+    def forward(self, *args):
         results = [layer(args) for layer in layers]
-'''
+        [x_mat, edge_w_mat, global_vec_mat]   = [[results[i][j] for i in results] for j in results[0]]
+        x = torch.stack(x_mat, dim=2)
+        x = torch.mean(x, dim=2, keepdim=True)
+
+        edge_w = torch.stack(edge_w_mat, dim=2)
+        edge_w = torch.mean(edge_w, dim=2, keepdim=True)
+
+        global_vec = torch.stack(global_vec_mat, dim=2)
+        global_vec = torch.mean(global_vec, dim=2, keepdim=True)
+
+        return x, edge_w, global_vec
+
 
 class MetaGNN(torch.nn.Module):
     def __init__(self, node_in, edge_in, global_dim):
@@ -430,6 +441,37 @@ class MetaGNN(torch.nn.Module):
         
         return global_vec
 
+class ChanneledMetaGNN(torch.nn.Module):
+    def __init__(self, node_in, edge_in, global_dim):
+        super(ChanneledMetaGNN, self).__init__()
+        node_out = global_dim
+        edge_out = global_dim
+        self.global_dim = global_dim
+        self.conv1 = ChanneledMetaLayer(EdgeModel_input(node_in, edge_in, node_out, edge_out, global_dim), NodeModel_input(node_in, edge_in, node_out, edge_out, global_dim), GlobalModel(node_in, edge_in, node_out, edge_out, global_dim))
+        self.conv2 = ChanneledMetaLayer(EdgeModel(node_out, edge_out, node_out, edge_out, global_dim), NodeModel(node_out, edge_out, node_out, edge_out, global_dim), GlobalModel(node_out, edge_out, node_out, edge_out, global_dim))
+        self.conv3 = ChanneledMetaLayer(EdgeModel(node_out, edge_out, node_out, edge_out, global_dim), NodeModel(node_out, edge_out, node_out, edge_out, global_dim), GlobalModel(node_out, edge_out, node_out, edge_out, global_dim))
+        self.linear = nn.Linear(global_dim, global_dim)
+        
+        def init_weights(m):
+            if type(m) == nn.Linear:
+        #        torch.nn.init.kaiming_normal_(m.weight)
+                m.bias.data.fill_(0.01)
+        self.apply(init_weights)
+        
+    def forward(self, sg):
+        x, edge_idx, edge_w = sg
+        E = edge_w
+        device = x.get_device()
+        N = len(x)
+        batch = torch.zeros((N,), dtype=torch.long, device=device)
+        global_vec = torch.normal(mean=0, std=0.01, size=(1,self.global_dim), device=device)
+        x, edge_w, global_vec = self.conv1(x, edge_idx, edge_w, global_vec, batch)
+        x, edge_w, global_vec = self.conv2(x, edge_idx, edge_w, global_vec, batch)
+        x, edge_w, global_vec = self.conv3(x, edge_idx, edge_w, global_vec, batch)
+        global_vec = self.linear(global_vec)
+        
+        return global_vec
+
 
 
 
@@ -439,9 +481,7 @@ def build_gnn(cfg):
     return gnn
 
 if __name__ == '__main__':
-    gnn = MetaGNN(1, 2, 4, 2, 5)
-    global_vec = torch.zeros((1,5))
-    batch = torch.zeros((4,), dtype=torch.long)
+    gnn = ChanneledMetaGNN(1, 2, 5)
     #gnn = SimpleGNN(1, 2, 4)
     x = torch.zeros((4, 1))
     y = torch.tensor([[0, 1, 1, 2],

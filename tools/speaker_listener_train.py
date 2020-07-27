@@ -33,7 +33,7 @@ from maskrcnn_benchmark.data import make_data_loader
 from maskrcnn_benchmark.engine.inference import listener_inference
 from maskrcnn_benchmark.engine.trainer import reduce_loss_dict
 from maskrcnn_benchmark.listener.listener import build_listener
-from maskrcnn_benchmark.listener.utils import collate_sgs, format_scores, format_scores_reg
+from maskrcnn_benchmark.listener.utils import collate_sgs, format_scores, format_scores_reg, MistakeSaver
 from maskrcnn_benchmark.modeling.detector import build_detection_model
 from maskrcnn_benchmark.solver import (make_listener_optimizer,
                                        make_lr_scheduler, make_optimizer)
@@ -184,10 +184,14 @@ def train(cfg, local_rank, distributed, logger):
     print_first_grad = True
 
     listener_loss_func = torch.nn.MarginRankingLoss(margin=1, reduction='none')
-    #reg_loss = torch.nn.MSELoss(reduction='none')
+    mistake_saver = None
+    if is_main_process():
+        mistake_saver = MistakeSaver('/Scene-Graph-Benchmark.pytorch/filenames_masked')
+
     is_printed = False
     while True:
         try:
+            listener_iteration=0
             for iteration, (images, targets, image_ids) in enumerate(train_data_loader, start_iter):
                 listener_optimizer.zero_grad()
 
@@ -199,6 +203,7 @@ def train(cfg, local_rank, distributed, logger):
 
                 data_time = time.time() - end
                 iteration = iteration + 1
+                listener_iteration += 1
                 arguments["iteration"] = iteration
                 model.train()
                 fix_eval_modules(eval_modules)
@@ -212,14 +217,15 @@ def train(cfg, local_rank, distributed, logger):
                     if not is_printed:
                         transform = transforms.ToPILImage()
                         print('SAVING IMAGE')
-                        img = transform(images[2])
+                        img = transform(images[0])
                         print('DONE TRANSFORM')
-                        img.save('img3.png')
+                        img.save('image.png')
                         print('DONE SAVING IMAGE')
-                        print('ids ', image_ids[2])
+                        print('ids ', image_ids[0])
                         is_printed = True
+                '''       
                 
-                
+                '''
                 transform = transforms.Compose([
                     transforms.ToPILImage(),
                     #transforms.Resize((cfg.LISTENER.IMAGE_SIZE, cfg.LISTENER.IMAGE_SIZE)),
@@ -300,14 +306,26 @@ def train(cfg, local_rank, distributed, logger):
                     for j in range(loss_matrix.size(2)):
                         if loss_matrix[0][i][i] > loss_matrix[0][i][j]:
                             temp_sg_acc += 1
+                        else:
+                            if is_main_process() and listener_iteration>300 and listener_iteration % 50 == 0 and i!=j:
+                                detached_sg_i = (sgs[i][0].detach().requires_grad_(), sgs[i][1], sgs[i][2].detach().requires_grad_())
+                                detached_sg_j = (sgs[j][0].detach().requires_grad_(), sgs[j][1], sgs[j][2].detach().requires_grad_())
+                                mistake_saver.add_mistake((image_ids[i],image_ids[j]), (detached_sg_i,detached_sg_j), listener_iteration, 'SG')
                         if loss_matrix[1][i][i] > loss_matrix[1][j][i]:
                             temp_img_acc += 1  
+                        else:
+                            if is_main_process() and listener_iteration>300 and listener_iteration % 50 == 0 and i!=j:
+                                detached_sg_i = (sgs[i][0].detach().requires_grad_(), sgs[i][1], sgs[i][2].detach().requires_grad_())
+                                detached_sg_j = (sgs[j][0].detach().requires_grad_(), sgs[j][1], sgs[j][2].detach().requires_grad_())
+                                mistake_saver.add_mistake((image_ids[i],image_ids[j]), (detached_sg_i,detached_sg_j), listener_iteration, 'IMG')
 
                     temp_sg_acc = temp_sg_acc*100/(loss_matrix.size(1)-1)
                     temp_img_acc = temp_img_acc*100/(loss_matrix.size(1)-1)
                     sg_acc += temp_sg_acc
                     img_acc += temp_img_acc
-
+                if is_main_process() and listener_iteration % 500 == 0:    
+                    mistake_saver.toHtml('/Scene-Graph-Benchmark.pytorch')
+                    
                 sg_acc /= loss_matrix.size(1)
                 img_acc /= loss_matrix.size(1)
 
