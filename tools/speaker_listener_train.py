@@ -24,7 +24,7 @@ from PIL import Image
 from pytorch_memlab import profile, MemReporter
 from torch.nn.utils import clip_grad_norm_
 from torchvision import transforms
-
+from maskrcnn_benchmark.config.paths_catalog import DatasetCatalog
 # Speaker Listener imports
 import maskrcnn_benchmark.listener
 import maskrcnn_benchmark.structures.image_list
@@ -33,7 +33,7 @@ from maskrcnn_benchmark.data import make_data_loader
 from maskrcnn_benchmark.engine.inference import listener_inference
 from maskrcnn_benchmark.engine.trainer import reduce_loss_dict
 from maskrcnn_benchmark.listener.listener import build_listener
-from maskrcnn_benchmark.listener.utils import collate_sgs, format_scores, format_scores_reg, MistakeSaver
+from maskrcnn_benchmark.listener.utils import collate_sgs, format_scores, format_scores_reg, MistakeSaver, load_vg_info
 from maskrcnn_benchmark.modeling.detector import build_detection_model
 from maskrcnn_benchmark.solver import (make_listener_optimizer,
                                        make_lr_scheduler, make_optimizer)
@@ -186,7 +186,12 @@ def train(cfg, local_rank, distributed, logger):
     listener_loss_func = torch.nn.MarginRankingLoss(margin=1, reduction='none')
     mistake_saver = None
     if is_main_process():
-        mistake_saver = MistakeSaver('/Scene-Graph-Benchmark.pytorch/filenames_masked')
+        ds_catalog = DatasetCatalog()
+        dict_file_path = os.path.join(ds_catalog.DATA_DIR, ds_catalog.DATASETS['VG_stanford_filtered_with_attribute']['dict_file'])
+        ind_to_classes, ind_to_predicates = load_vg_info(dict_file_path)
+        ind_to_classes = {k:v for k,v in enumerate(ind_to_classes)}
+        ind_to_predicates = {k:v for k,v in enumerate(ind_to_predicates)}
+        mistake_saver = MistakeSaver('/Scene-Graph-Benchmark.pytorch/filenames_masked', ind_to_classes, ind_to_predicates)
 
     is_printed = False
     while True:
@@ -296,7 +301,7 @@ def train(cfg, local_rank, distributed, logger):
                     loss_matrix[1][true_index] = loss_vec
 
 
-                print('iteration:', iteration)
+                print('iteration:', listener_iteration)
                 sg_acc = 0
                 img_acc = 0
                 # calculate accuracy
@@ -307,14 +312,14 @@ def train(cfg, local_rank, distributed, logger):
                         if loss_matrix[0][i][i] > loss_matrix[0][i][j]:
                             temp_sg_acc += 1
                         else:
-                            if is_main_process() and listener_iteration>300 and listener_iteration % 50 == 0 and i!=j:
+                            if is_main_process() and listener_iteration>0 and listener_iteration % 1 ==0 and i != j:
                                 detached_sg_i = (sgs[i][0].detach().requires_grad_(), sgs[i][1], sgs[i][2].detach().requires_grad_())
                                 detached_sg_j = (sgs[j][0].detach().requires_grad_(), sgs[j][1], sgs[j][2].detach().requires_grad_())
                                 mistake_saver.add_mistake((image_ids[i],image_ids[j]), (detached_sg_i,detached_sg_j), listener_iteration, 'SG')
                         if loss_matrix[1][i][i] > loss_matrix[1][j][i]:
                             temp_img_acc += 1  
                         else:
-                            if is_main_process() and listener_iteration>300 and listener_iteration % 50 == 0 and i!=j:
+                            if is_main_process() and listener_iteration>0 and listener_iteration % 1 == 0 and i!=j:
                                 detached_sg_i = (sgs[i][0].detach().requires_grad_(), sgs[i][1], sgs[i][2].detach().requires_grad_())
                                 detached_sg_j = (sgs[j][0].detach().requires_grad_(), sgs[j][1], sgs[j][2].detach().requires_grad_())
                                 mistake_saver.add_mistake((image_ids[i],image_ids[j]), (detached_sg_i,detached_sg_j), listener_iteration, 'IMG')
@@ -323,7 +328,7 @@ def train(cfg, local_rank, distributed, logger):
                     temp_img_acc = temp_img_acc*100/(loss_matrix.size(1)-1)
                     sg_acc += temp_sg_acc
                     img_acc += temp_img_acc
-                if is_main_process() and listener_iteration % 500 == 0:    
+                if is_main_process() and listener_iteration % 1  == 0 and listener_iteration >= 0:    
                     mistake_saver.toHtml('/Scene-Graph-Benchmark.pytorch')
                     
                 sg_acc /= loss_matrix.size(1)
