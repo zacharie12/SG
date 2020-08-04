@@ -329,7 +329,7 @@ def train(cfg, local_rank, distributed, logger):
                     sg_acc += temp_sg_acc
                     img_acc += temp_img_acc
                 if is_main_process() and listener_iteration % 1  == 0 and listener_iteration >= 0:    
-                    mistake_saver.toHtml('/Scene-Graph-Benchmark.pytorch')
+                    mistake_saver.toHtml('/www')
                     
                 sg_acc /= loss_matrix.size(1)
                 img_acc /= loss_matrix.size(1)

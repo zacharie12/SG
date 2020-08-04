@@ -114,8 +114,8 @@ class MistakeSaver():
 
     # WE ASSUME RETURN VALUE IS A PIL Image
     def sg_to_image(self, sg):
-        dot = Digraph('unix', format='png', node_attr={'color': 'lightblue2', 'style': 'filled'})
-        dot.attr(size='10,10')
+        dot = Digraph(format='png', node_attr={'shape':"box",'style':"rounded,filled",'fontsize':"48",'color':"none", 'fillcolor':"lightpink1"})
+        dot.attr(size='5,3')
 
         (node_w, edge_idx, edge_w) = sg
         # add nodes to graph
@@ -131,9 +131,9 @@ class MistakeSaver():
                 dot.edge(str(src), str(dst), label=edge_label)
 
         dot.render('temp', view=False, format='jpeg')
-
-        return Image.open("temp.jpeg")
-
+        img =  Image.open("temp.jpeg")
+        os.remove('temp.jpeg')
+        return img
 
 def load_vg_info(dict_file, add_bg=True):
     """
