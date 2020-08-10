@@ -82,16 +82,18 @@ class MistakeSaver():
                     with table().add(tbody()):
                         for num_couple, (img_couple, sg_couple) in enumerate(zip(self.img_dict[iteration_number], self.sg_dict[iteration_number])):
                             with tr():
-                                first_img = os.path.splitext(os.path.basename(lines[img_couple[0]+1]))[0]
-                                second_img = os.path.splitext(os.path.basename(lines[img_couple[1]+1]))[0]
+                                first_img = os.path.splitext(os.path.basename(lines[img_couple[0]]))[0]
+                                second_img = os.path.splitext(os.path.basename(lines[img_couple[1]]))[0]
 
+                          
+                   
                                 first_img_link = api.get_image_data(id=first_img).url
                                 second_img_link = api.get_image_data(id=second_img).url
                                 # HTML img tag
                                 with td():
-                                    img(src=first_img_link, style="width:112px;height:112px")
+                                    img(src=first_img_link, style="width:224px;height:224px")
                                 with td():
-                                    img(src=second_img_link, style="width:112px;height:112px")
+                                    img(src=second_img_link, style="width:224px;height:224px")
 
                                 first_sg = self.sg_to_image(sg_couple[0])
                                 second_sg = self.sg_to_image(sg_couple[1])
@@ -102,11 +104,15 @@ class MistakeSaver():
                                 second_sg_path = os.path.join(img_dir, f'{iteration_number}_{num_couple}_{1}.jpeg')
                                 second_sg.save(os.path.join(outpath, second_sg_path), 'JPEG')
                                 with td():
-                                    img(src=first_sg_path, style="width:112px;height:112px")
+                                    img(src=first_sg_path)
                                 with td():
-                                    img(src=second_sg_path, style="width:112px;height:112px")
+                                    img(src=second_sg_path)
                                 with td():
-                                    p(img_couple[2])
+                                    if img_couple[2] == 'SG':
+                                        p('SG, IMG, IMG')
+                                    else:
+                                        p('IMG, SG, SG')
+                                    
 
         with open(os.path.join(outpath, 'MistakeCouples.html'), 'w') as outfile:
             outfile.write(str(doc))
@@ -114,19 +120,22 @@ class MistakeSaver():
 
     # WE ASSUME RETURN VALUE IS A PIL Image
     def sg_to_image(self, sg):
-        dot = Digraph(format='png', node_attr={'shape':"box",'style':"rounded,filled",'fontsize':"48",'color':"none", 'fillcolor':"lightpink1"})
+        dot = Digraph(format='png', node_attr={'shape':"box",'style':"rounded,filled",'fontsize':"48",'color':"none", 'fillcolor':"lightpink1"} , edge_attr={'fontsize':'32'})
         dot.attr(size='5,3')
+        dot.attr('dpi', '300')
 
         (node_w, edge_idx, edge_w) = sg
         # add nodes to graph
         for i, node in enumerate(node_w):
-            node_label = self.index_to_obj_label[torch.argmax(F.softmax(node)).item()]
+            node_label = self.index_to_obj_label[torch.argmax(node).item()]
             dot.node(str(i), label=node_label)
         
         # add edges to graph
         for i, edge in enumerate(edge_w):
             src, dst = edge_idx[0][i].item(), edge_idx[1][i].item()
-            edge_label = self.index_to_rel_label[torch.argmax(F.softmax(edge)).item()]
+            edge = F.softmax(edge)
+            edge[0] = 0.         
+            edge_label = self.index_to_rel_label[torch.argmax(edge).item()]
             if edge_label != '__background__':
                 dot.edge(str(src), str(dst), label=edge_label)
 

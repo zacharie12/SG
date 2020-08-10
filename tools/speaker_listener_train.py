@@ -107,7 +107,6 @@ def train(cfg, local_rank, distributed, logger):
     listener, listener_optimizer = amp.initialize(listener, listener_optimizer, opt_level='O0')
     model, optimizer = amp.initialize(model, optimizer, opt_level=amp_opt_level)
 
-    listener.float()
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank,
@@ -135,13 +134,21 @@ def train(cfg, local_rank, distributed, logger):
     )
 
     listener_checkpointer = Checkpointer(
-        listener, listener_optimizer, listener_scheduler, listener_dir, save_to_disk, custom_scheduler=False
+        listener, optimizer=listener_optimizer, save_dir=listener_dir, save_to_disk=save_to_disk, custom_scheduler=False
     )
 
     # if there is certain checkpoint in output_dir, load it, else load pretrained detector
     if listener_checkpointer.has_checkpoint():
-        extra_listener_checkpoint_data = listener_checkpointer.load('')
-        arguments.update(extra_listener_checkpoint_data)
+        extra_listener_checkpoint_data = listener_checkpointer.load()
+        listener = listener.to(torch.float32)
+
+        '''
+        print('Weights after load: ')
+        print('****************************')
+        print(listener.gnn.conv1.node_model.node_mlp_1[0].weight)
+        print('****************************')
+        '''
+        # arguments.update(extra_listener_checkpoint_data)
 
     if checkpointer.has_checkpoint():
         extra_checkpoint_data = checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
@@ -191,9 +198,10 @@ def train(cfg, local_rank, distributed, logger):
         ind_to_classes, ind_to_predicates = load_vg_info(dict_file_path)
         ind_to_classes = {k:v for k,v in enumerate(ind_to_classes)}
         ind_to_predicates = {k:v for k,v in enumerate(ind_to_predicates)}
+        print('ind to classes:', ind_to_classes, '/n ind to predicates:', ind_to_predicates)
         mistake_saver = MistakeSaver('/Scene-Graph-Benchmark.pytorch/filenames_masked', ind_to_classes, ind_to_predicates)
 
-    is_printed = False
+    #is_printed = False
     while True:
         try:
             listener_iteration=0
@@ -217,18 +225,7 @@ def train(cfg, local_rank, distributed, logger):
                
                 #SAVE IMAGE TO PC
 
-                '''
-                if is_main_process():
-                    if not is_printed:
-                        transform = transforms.ToPILImage()
-                        print('SAVING IMAGE')
-                        img = transform(images[0])
-                        print('DONE TRANSFORM')
-                        img.save('image.png')
-                        print('DONE SAVING IMAGE')
-                        print('ids ', image_ids[0])
-                        is_printed = True
-                '''       
+                
                 
                 '''
                 transform = transforms.Compose([
@@ -239,6 +236,20 @@ def train(cfg, local_rank, distributed, logger):
                 '''
                 # turn images to a uniform size
                 #print('IMAGE BEFORE Transform: ', images[0], 'GPU: ', get_rank())
+                '''
+
+                if is_main_process():
+                    if not is_printed:
+                        transform = transforms.ToPILImage()
+                        print('SAVING IMAGE')
+                        img = transform(images[0].cpu())
+                        print('DONE TRANSFORM')
+                        img.save('image.png')
+                        print('DONE SAVING IMAGE')
+                        print('ids ', image_ids[0])
+
+                '''        
+
                 for i in range(len(images)):
                     images[i] = images[i].unsqueeze(0)
                     images[i] = F.interpolate(images[i], size=(224, 224), mode='bilinear', align_corners=False)
@@ -251,7 +262,6 @@ def train(cfg, local_rank, distributed, logger):
 
                 #print('IMAGE BEFORE Model: ', images[0], 'GPU: ', get_rank())
                 _, sgs = model(images_list, targets)
-
                 #print('IMAGE AFTER Model: ', images)
                 '''
                 is_printed = False
@@ -268,6 +278,16 @@ def train(cfg, local_rank, distributed, logger):
                 '''
                 image_list = None
                 sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
+                
+                ''' 
+
+                if is_main_process():
+                    if not is_printed:
+                        mistake_saver.add_mistake((image_ids[0], image_ids[1]), (sgs[0], sgs[1]), 231231, 'SG') 
+                        mistake_saver.toHtml('/www')
+                        is_printed = True
+                
+                ''' 
 
                 listener_loss = 0
                 gap_reward = 0
@@ -277,8 +297,9 @@ def train(cfg, local_rank, distributed, logger):
                 # fill score matrix
                 for true_index, sg in enumerate(sgs):
                     acc = 0
-                    detached_sg = (sg[0].detach().requires_grad_(), sg[1], sg[2].detach().requires_grad_() )
+                    detached_sg = (sg[0].detach().requires_grad_().float(), sg[1], sg[2].detach().requires_grad_().float() )
                     #scores = listener(sg, images)
+                  #  with amp.disable_casts():
                     scores = listener(detached_sg, images)
                     score_matrix[true_index] = scores
 
@@ -312,23 +333,23 @@ def train(cfg, local_rank, distributed, logger):
                         if loss_matrix[0][i][i] > loss_matrix[0][i][j]:
                             temp_sg_acc += 1
                         else:
-                            if is_main_process() and listener_iteration>0 and listener_iteration % 1 ==0 and i != j:
-                                detached_sg_i = (sgs[i][0].detach().requires_grad_(), sgs[i][1], sgs[i][2].detach().requires_grad_())
-                                detached_sg_j = (sgs[j][0].detach().requires_grad_(), sgs[j][1], sgs[j][2].detach().requires_grad_())
+                            if is_main_process() and listener_iteration>=300 and listener_iteration % 25 ==0 and i != j:
+                                detached_sg_i = (sgs[i][0].detach(), sgs[i][1], sgs[i][2].detach())
+                                detached_sg_j = (sgs[j][0].detach(), sgs[j][1], sgs[j][2].detach())
                                 mistake_saver.add_mistake((image_ids[i],image_ids[j]), (detached_sg_i,detached_sg_j), listener_iteration, 'SG')
                         if loss_matrix[1][i][i] > loss_matrix[1][j][i]:
                             temp_img_acc += 1  
                         else:
-                            if is_main_process() and listener_iteration>0 and listener_iteration % 1 == 0 and i!=j:
-                                detached_sg_i = (sgs[i][0].detach().requires_grad_(), sgs[i][1], sgs[i][2].detach().requires_grad_())
-                                detached_sg_j = (sgs[j][0].detach().requires_grad_(), sgs[j][1], sgs[j][2].detach().requires_grad_())
+                            if is_main_process() and listener_iteration>=300 and listener_iteration % 25 == 0 and i!=j:
+                                detached_sg_i = (sgs[i][0].detach(), sgs[i][1], sgs[i][2].detach())
+                                detached_sg_j = (sgs[j][0].detach(), sgs[j][1], sgs[j][2].detach())
                                 mistake_saver.add_mistake((image_ids[i],image_ids[j]), (detached_sg_i,detached_sg_j), listener_iteration, 'IMG')
 
                     temp_sg_acc = temp_sg_acc*100/(loss_matrix.size(1)-1)
                     temp_img_acc = temp_img_acc*100/(loss_matrix.size(1)-1)
                     sg_acc += temp_sg_acc
                     img_acc += temp_img_acc
-                if is_main_process() and listener_iteration % 1  == 0 and listener_iteration >= 0:    
+                if is_main_process() and listener_iteration % 100  == 0 and listener_iteration >= 300:    
                     mistake_saver.toHtml('/www')
                     
                 sg_acc /= loss_matrix.size(1)
@@ -429,9 +450,16 @@ def train(cfg, local_rank, distributed, logger):
                     )
 
                 if iteration % checkpoint_period == 0:
-                    listener_checkpointer.save("model_{:07d}".format(iteration), **arguments)
+                    """
+                    print('Model before save')
+                    print('****************************')
+                    print(listener.gnn.conv1.node_model.node_mlp_1[0].weight)
+                    print('****************************')
+                    """
+                    with amp.disable_casts():
+                        listener_checkpointer.save("model_{:07d}".format(iteration))
                 if iteration == max_iter:
-                    listener_checkpointer.save("model_final", **arguments)
+                    listener_checkpointer.save("model_final")
 
                 val_result = None # used for scheduler updating
                 if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:

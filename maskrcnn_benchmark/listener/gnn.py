@@ -311,7 +311,8 @@ class EdgeModel_input(torch.nn.Module):
         # u: [B, F_u], where B is the number of graphs.
         # batch: [E] with max entry B - 1.
         out = torch.cat([src, dest, edge_attr], 1)
-        return self.edge_mlp(out)
+        out = self.edge_mlp(out)
+        return out
         
 
 class NodeModel(torch.nn.Module):
@@ -429,12 +430,14 @@ class MetaGNN(torch.nn.Module):
         
     def forward(self, sg):
         x, edge_idx, edge_w = sg
+        x = x.float()
         E = edge_w
         device = x.get_device()
         N = len(x)
         batch = torch.zeros((N,), dtype=torch.long, device=device)
         global_vec = torch.normal(mean=0, std=0.01, size=(1,self.global_dim), device=device)
         x, edge_w, global_vec = self.conv1(x, edge_idx, edge_w, global_vec, batch)
+        #print('X after: ', x)
         x, edge_w, global_vec = self.conv2(x, edge_idx, edge_w, global_vec, batch)
         x, edge_w, global_vec = self.conv3(x, edge_idx, edge_w, global_vec, batch)
         global_vec = self.linear(global_vec)
