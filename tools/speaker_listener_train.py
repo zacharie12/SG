@@ -3,6 +3,8 @@
 Basic training script for PyTorch
 """
 
+# Shlomi Ha Gever.
+
 # Set up custom environment before nearly anything else is imported
 # NOTE: this should be the first import (no not reorder)
 from maskrcnn_benchmark.utils.env import setup_environment  # noqa F401 isort:skip
@@ -11,7 +13,6 @@ import datetime
 import os
 import time
 from copy import deepcopy
-import GPUtil
 import PIL
 import torch
 import torch.nn.functional as F
@@ -21,7 +22,6 @@ import torchvision
 # and enable mixed-precision via apex.amp
 import wandb
 from PIL import Image
-from pytorch_memlab import profile, MemReporter
 from torch.nn.utils import clip_grad_norm_
 from torchvision import transforms
 from maskrcnn_benchmark.config.paths_catalog import DatasetCatalog
@@ -55,7 +55,6 @@ try:
 except ImportError:
     raise ImportError('Use APEX for multi-precision via apex.amp')
 
-@profile
 def train(cfg, local_rank, distributed, logger):
     if is_main_process():
         wandb.init(project='scene-graph', entity='sgg-speaker-listener', config=cfg.LISTENER)
@@ -104,8 +103,9 @@ def train(cfg, local_rank, distributed, logger):
     # Initialize mixed-precision training
     use_mixed_precision = cfg.DTYPE == "float16"
     amp_opt_level = 'O1' if use_mixed_precision else 'O0'
-    listener, listener_optimizer = amp.initialize(listener, listener_optimizer, opt_level='O0')
-    model, optimizer = amp.initialize(model, optimizer, opt_level=amp_opt_level)
+    #listener, listener_optimizer = amp.initialize(listener, listener_optimizer, opt_level='O0')
+    [model, listener], [optimizer, listener_optimizer] = amp.initialize([model, listener], [optimizer, listener_optimizer], opt_level='O1', loss_scale=1)
+    model = amp.initialize(model, opt_level='O1')
 
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -137,19 +137,7 @@ def train(cfg, local_rank, distributed, logger):
         listener, optimizer=listener_optimizer, save_dir=listener_dir, save_to_disk=save_to_disk, custom_scheduler=False
     )
 
-    # if there is certain checkpoint in output_dir, load it, else load pretrained detector
-    if listener_checkpointer.has_checkpoint():
-        extra_listener_checkpoint_data = listener_checkpointer.load()
-        listener = listener.to(torch.float32)
-
-        '''
-        print('Weights after load: ')
-        print('****************************')
-        print(listener.gnn.conv1.node_model.node_mlp_1[0].weight)
-        print('****************************')
-        '''
-        # arguments.update(extra_listener_checkpoint_data)
-
+    
     if checkpointer.has_checkpoint():
         extra_checkpoint_data = checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
                                        update_schedule=cfg.SOLVER.UPDATE_SCHEDULE_DURING_LOAD)
@@ -157,6 +145,18 @@ def train(cfg, local_rank, distributed, logger):
     else:
         # load_mapping is only used when we init current model from detection model.
         checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, with_optim=False, load_mapping=load_mapping)
+        
+    # if there is certain checkpoint in output_dir, load it, else load pretrained detector
+    if listener_checkpointer.has_checkpoint():
+        extra_listener_checkpoint_data = listener_checkpointer.load()
+        amp.load_state_dict(extra_listener_checkpoint_data['amp'])
+        '''
+        print('Weights after load: ')
+        print('****************************')
+        print(listener.gnn.conv1.node_model.node_mlp_1[0].weight)
+        print('****************************')
+        '''
+        # arguments.update(extra_listener_checkpoint_data)
     debug_print(logger, 'end load checkpointer')
     train_data_loader = make_data_loader(
         cfg,
@@ -297,10 +297,10 @@ def train(cfg, local_rank, distributed, logger):
                 # fill score matrix
                 for true_index, sg in enumerate(sgs):
                     acc = 0
-                    detached_sg = (sg[0].detach().requires_grad_().float(), sg[1], sg[2].detach().requires_grad_().float() )
+                    detached_sg = (sg[0].detach().requires_grad_().to(torch.float32), sg[1].long(), sg[2].detach().requires_grad_().to(torch.float32))
                     #scores = listener(sg, images)
-                  #  with amp.disable_casts():
-                    scores = listener(detached_sg, images)
+                    with amp.disable_casts():
+                        scores = listener(detached_sg, images)
                     score_matrix[true_index] = scores
 
                 #print('Score matrix:', score_matrix)
@@ -333,14 +333,14 @@ def train(cfg, local_rank, distributed, logger):
                         if loss_matrix[0][i][i] > loss_matrix[0][i][j]:
                             temp_sg_acc += 1
                         else:
-                            if is_main_process() and listener_iteration>=300 and listener_iteration % 25 ==0 and i != j:
+                            if is_main_process() and listener_iteration>=600 and listener_iteration % 25 ==0 and i != j:
                                 detached_sg_i = (sgs[i][0].detach(), sgs[i][1], sgs[i][2].detach())
                                 detached_sg_j = (sgs[j][0].detach(), sgs[j][1], sgs[j][2].detach())
                                 mistake_saver.add_mistake((image_ids[i],image_ids[j]), (detached_sg_i,detached_sg_j), listener_iteration, 'SG')
                         if loss_matrix[1][i][i] > loss_matrix[1][j][i]:
                             temp_img_acc += 1  
                         else:
-                            if is_main_process() and listener_iteration>=300 and listener_iteration % 25 == 0 and i!=j:
+                            if is_main_process() and listener_iteration>=600 and listener_iteration % 25 == 0 and i!=j:
                                 detached_sg_i = (sgs[i][0].detach(), sgs[i][1], sgs[i][2].detach())
                                 detached_sg_j = (sgs[j][0].detach(), sgs[j][1], sgs[j][2].detach())
                                 mistake_saver.add_mistake((image_ids[i],image_ids[j]), (detached_sg_i,detached_sg_j), listener_iteration, 'IMG')
@@ -349,7 +349,7 @@ def train(cfg, local_rank, distributed, logger):
                     temp_img_acc = temp_img_acc*100/(loss_matrix.size(1)-1)
                     sg_acc += temp_sg_acc
                     img_acc += temp_img_acc
-                if is_main_process() and listener_iteration % 100  == 0 and listener_iteration >= 300:    
+                if is_main_process() and listener_iteration % 100 == 0 and listener_iteration >= 600:    
                     mistake_saver.toHtml('/www')
                     
                 sg_acc /= loss_matrix.size(1)
@@ -456,10 +456,13 @@ def train(cfg, local_rank, distributed, logger):
                     print(listener.gnn.conv1.node_model.node_mlp_1[0].weight)
                     print('****************************')
                     """
-                    with amp.disable_casts():
-                        listener_checkpointer.save("model_{:07d}".format(iteration))
+                    listener_checkpointer.save("model_{:07d}".format(listener_iteration), amp=amp.state_dict())
+                    #listener_checkpointer.save("model_{:07d}".format(listener_iteration))
+
                 if iteration == max_iter:
-                    listener_checkpointer.save("model_final")
+                    listener_checkpointer.save("model_final", amp=amp.state_dict())
+                    #listener_checkpointer.save("model_final")
+
 
                 val_result = None # used for scheduler updating
                 if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
@@ -476,7 +479,9 @@ def train(cfg, local_rank, distributed, logger):
                         })
                         
                     logger.info("Validation Result: %.4f" % val_result)
-        except:
+        except Exception as err:
+            raise(err)
+            print('Dataset finished, creating new')
             train_data_loader = make_data_loader(
                 cfg,
                 mode='train',

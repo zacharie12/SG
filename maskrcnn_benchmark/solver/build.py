@@ -124,6 +124,7 @@ def make_listener_optimizer(cfg, model):
         params += [{'params': [value]}]
     optimizer = torch.optim.Adam(params, lr=cfg.LISTENER.LR, weight_decay=cfg.LISTENER.WEIGHT_DECAY)
     #optimizer = LARS(params, lr=cfg.LISTENER.LR)
+    #optimizer = torch.optim.SGD(params=params, lr=cfg.LISTENER.LR, momentum=0.9)
     return optimizer
 
 def make_lr_scheduler(cfg, optimizer, logger=None):

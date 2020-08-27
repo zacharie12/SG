@@ -47,17 +47,8 @@ class GaussGNN(Gnn):
         self.conv2 = GMMConv(in_channels, in_channels,  dim, kernel_size=25)
         self.conv3 = GMMConv(in_channels, in_channels,  dim, kernel_size=25)
         self.linear = nn.Linear(in_channels, out_size)
-        '''
-        self.pooling = GlobalAttention(
-            nn.Sequential(
-                nn.Linear(in_channels, 1),
-            ),
-            nn.Sequential(
-                nn.Linear(in_channels, in_channels)
-            )
-        )
-        '''
-
+  
+                         
     def forward(self, sg):
         x, edge_idx, edge_w = sg
         # x = x.float()
@@ -65,7 +56,7 @@ class GaussGNN(Gnn):
         N = len(x)
         x = self.conv1(x, edge_idx, edge_w)
         x = F.relu(x)
-        #x = F.dropout(x, training=self.training)
+        x = F.dropout(x, training=self.training)
         x = self.conv2(x, edge_idx, edge_w)
         x = F.relu(x)
         #x = F.dropout(x, training=self.training)
@@ -77,6 +68,10 @@ class GaussGNN(Gnn):
         x = self.linear(x)
 
         return x
+
+
+
+
 
 
 
@@ -341,7 +336,8 @@ class NodeModel(torch.nn.Module):
         out = self.node_mlp_1(out)
         out = scatter_mean(out, col, dim=0, dim_size=x.size(0))
         out = torch.cat([x, out, u[batch]], dim=1)
-        return self.node_mlp_2(out)
+        out = self.node_mlp_2(out)
+        return out
 
 class NodeModel_input(torch.nn.Module):
     def __init__(self, node_in, edge_in, node_out, edge_out, global_dim):
@@ -369,7 +365,8 @@ class NodeModel_input(torch.nn.Module):
         out = self.node_mlp_1(out)
         out = scatter_mean(out, col, dim=0, dim_size=x.size(0))
         out = torch.cat([x, out], dim=1)
-        return self.node_mlp_2(out)
+        out = self.node_mlp_2(out)
+        return out
 
 class GlobalModel(torch.nn.Module):
     def __init__(self, node_in, edge_in, node_out, edge_out, global_dim):
@@ -387,7 +384,8 @@ class GlobalModel(torch.nn.Module):
         # u: [B, F_u]
         # batch: [N] with max entry B - 1.
         out = torch.cat([u, scatter_mean(x, batch, dim=0)], dim=1)
-        return self.global_mlp(out)
+        out = self.global_mlp(out)
+        return out
 
 
 class ChanneledMetaLayer(nn.Module):
@@ -429,7 +427,6 @@ class MetaGNN(torch.nn.Module):
         self.apply(init_weights)
         
     def forward(self, sg):
-        x, edge_idx, edge_w = sg
         x = x.float()
         E = edge_w
         device = x.get_device()
@@ -437,7 +434,6 @@ class MetaGNN(torch.nn.Module):
         batch = torch.zeros((N,), dtype=torch.long, device=device)
         global_vec = torch.normal(mean=0, std=0.01, size=(1,self.global_dim), device=device)
         x, edge_w, global_vec = self.conv1(x, edge_idx, edge_w, global_vec, batch)
-        #print('X after: ', x)
         x, edge_w, global_vec = self.conv2(x, edge_idx, edge_w, global_vec, batch)
         x, edge_w, global_vec = self.conv3(x, edge_idx, edge_w, global_vec, batch)
         global_vec = self.linear(global_vec)
@@ -478,9 +474,13 @@ class ChanneledMetaGNN(torch.nn.Module):
 
 
 
-GNN_ARCHITECHTURE = {'SimpleGNN':SimpleGNN, 'GaussGNN':GaussGNN, 'AGNN':AGNN, 'EAGNN':EAGNN, 'MetaGNN':MetaGNN }
+
+
+
+GNN_ARCHITECHTURE = {'SimpleGNN':SimpleGNN, 'GaussGNN':GaussGNN, 'AGNN':AGNN, 'EAGNN':EAGNN, 'MetaGNN':MetaGNN}
 def build_gnn(cfg):
     gnn = GNN_ARCHITECHTURE[cfg.LISTENER.GNN](cfg.LISTENER.NODE_SIZE, cfg.LISTENER.EDGE_SIZE, cfg.LISTENER.GNN_OUTPUT)
+    
     return gnn
 
 if __name__ == '__main__':

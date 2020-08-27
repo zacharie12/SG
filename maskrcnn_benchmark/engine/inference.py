@@ -219,7 +219,7 @@ def compute_listener_on_dataset(model, listener, data_loader, device, synchroniz
     torch.cuda.empty_cache()
     return results_dict
 
-
+'''
 
 def compute_listener_test_on_dataset(model, listener, data_loader, device, synchronize_gather=True, timer=None):
     # this function is going to calculate a matrix with size (len(data_loader), len(data_loader))
@@ -363,13 +363,16 @@ def compute_listener_test_on_dataset(model, listener, data_loader, device, synch
 
             if synchronize_gather:
                 synchronize()
-                '''
+                
+                # nedd to be '  '   '
                 gather_dict = {img_id: (sg_loss_i, img_loss_i, sg_acc_i, img_acc_i) \
                                         for img_id, sg_loss_i, img_loss_i, sg_acc_i, img_acc_i \
                                         in  zip(image_ids, sg_loss, img_loss, sg_acc, img_acc)}
                 
                 multi_gpu_predictions = all_gather(gather_dict)
-                '''
+
+                # need to be '  '   '
+
                 def merge_dicts(dict_list):
                     if not dict_list:
                         return dict_list
@@ -400,7 +403,7 @@ def compute_listener_test_on_dataset(model, listener, data_loader, device, synch
     return results_dict
 
 
-
+'''
 
 
 def _accumulate_predictions_from_multiple_gpus(predictions_per_gpu, synchronize_gather=True):

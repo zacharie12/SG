@@ -15,10 +15,10 @@ class Listener(nn.Module):
         
     def forward(self, sg, image):
         # Apply softmax to nodes and edges
-        (node_w, edge_index, edge_w) = sg
-        edge_w = F.softmax(edge_w, dim=1)
-        node_w = F.softmax(node_W, dim=1)
-        sg = (node_w, edge_index, edge_w)
+       # (node_w, edge_index, edge_w) = sg
+       # edge_w = F.softmax(edge_w, dim=1)
+       # node_w = F.softmax(node_w, dim=1)
+        #sg = (node_w, edge_index, edge_w)
         g_feature = self.gnn(sg)
         im_feature = self.cnn(image)
         batch_size = im_feature.size(0)

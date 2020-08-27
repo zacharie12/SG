@@ -122,7 +122,6 @@ class MistakeSaver():
     def sg_to_image(self, sg):
         dot = Digraph(format='png', node_attr={'shape':"box",'style':"rounded,filled",'fontsize':"48",'color':"none", 'fillcolor':"lightpink1"} , edge_attr={'fontsize':'32'})
         dot.attr(size='5,3')
-        dot.attr('dpi', '300')
 
         (node_w, edge_idx, edge_w) = sg
         # add nodes to graph
