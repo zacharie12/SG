@@ -427,7 +427,7 @@ class MetaGNN(torch.nn.Module):
         self.apply(init_weights)
         
     def forward(self, sg):
-        x = x.float()
+        x, edge_idx, edge_w = sg
         E = edge_w
         device = x.get_device()
         N = len(x)
@@ -439,6 +439,7 @@ class MetaGNN(torch.nn.Module):
         global_vec = self.linear(global_vec)
         
         return global_vec
+
 
 class ChanneledMetaGNN(torch.nn.Module):
     def __init__(self, node_in, edge_in, global_dim):

@@ -55,6 +55,64 @@ try:
 except ImportError:
     raise ImportError('Use APEX for multi-precision via apex.amp')
 
+class SpeakerListener(torch.nn.Module):
+    def __init__(self, speaker, listener, cfg, is_joint=False):
+        super(SpeakerListener, self).__init__()
+        self.speaker = speaker
+        self.listener = listener
+        self.cfg = cfg
+        self.is_joint = is_joint
+
+    def forward(self, speaker_images, targets, listener_images):
+        # *********************************************************************************
+        # TODO: NEED TO CHECK WHAT IS THIS FIRST ARGUMENT                                 *
+        # *********************************************************************************
+        speaker_loss, sgs = self.speaker(speaker_images, targets)
+        sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
+        print('speaker loss:', speaker_loss)
+
+        score_matrix = torch.zeros( (listener_images.size(0), listener_images.size(0)) ).to(listener_images.get_device())
+        for true_index, sg in enumerate(sgs):
+            if not self.is_joint:
+                detached_sg = (sg[0].detach().requires_grad_().to(torch.float32), sg[1].long(), sg[2].detach().requires_grad_().to(torch.float32))
+            else:
+                detached_sg = sg
+
+            scores = self.listener(detached_sg, listener_images)
+            #with amp.disable_casts():
+            #    scores = self.listener(detached_sg, listener_images)
+            score_matrix[true_index] = scores
+
+        if self.is_joint:
+            return score_matrix, sgs, speaker_loss
+        else:
+            return score_matrix
+
+    def add_speaker_checkpointer(self, checkpointer):
+        self.speaker_checkpointer = checkpointer
+    
+    def add_listener_checkpointer(self, checkpointer):
+        self.listener_checkpointer = checkpointer
+
+    def save_listener(self, name, **kwargs):
+        self.listener_checkpointer.save(name, kwargs)
+
+    def load_listener(self):
+        if self.listener_checkpointer.has_checkpoint():
+            extra_listener_checkpoint_data = self.listener_checkpointer.load()
+            amp.load_state_dict(extra_listener_checkpoint_data['amp'])
+
+    def save_speaker(self, name, **kwargs):
+        self.speaker_checkpointer.save(name, kwargs)
+
+    def load_speaker(self, load_mapping=None):
+        if self.speaker_checkpointer.has_checkpoint():
+            extra_checkpoint_data = self.speaker_checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
+                                        update_schedule=cfg.SOLVER.UPDATE_SCHEDULE_DURING_LOAD)
+        else:
+            # load_mapping is only used when we init current model from detection model.
+            self.speaker_checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, with_optim=False, load_mapping=load_mapping)
+        
 def train(cfg, local_rank, distributed, logger):
     if is_main_process():
         wandb.init(project='scene-graph', entity='sgg-speaker-listener', config=cfg.LISTENER)
@@ -62,6 +120,8 @@ def train(cfg, local_rank, distributed, logger):
 
     model = build_detection_model(cfg)
     listener = build_listener(cfg)
+
+    speaker_listener = SpeakerListener(model, listener, cfg, is_joint=False)
     if is_main_process():
         wandb.watch(listener)
         
@@ -103,9 +163,11 @@ def train(cfg, local_rank, distributed, logger):
     # Initialize mixed-precision training
     use_mixed_precision = cfg.DTYPE == "float16"
     amp_opt_level = 'O1' if use_mixed_precision else 'O0'
+
+    speaker_listener, listener_optimizer = amp.initialize(speaker_listener, listener_optimizer, opt_level='O0')
     #listener, listener_optimizer = amp.initialize(listener, listener_optimizer, opt_level='O0')
-    [model, listener], [optimizer, listener_optimizer] = amp.initialize([model, listener], [optimizer, listener_optimizer], opt_level='O1', loss_scale=1)
-    model = amp.initialize(model, opt_level='O1')
+    #[model, listener], [optimizer, listener_optimizer] = amp.initialize([model, listener], [optimizer, listener_optimizer], opt_level='O1', loss_scale=1)
+    #model = amp.initialize(model, opt_level='O1')
 
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -129,6 +191,7 @@ def train(cfg, local_rank, distributed, logger):
     output_dir = cfg.OUTPUT_DIR
     listener_dir = cfg.LISTENER_DIR 
     save_to_disk = get_rank() == 0
+
     checkpointer = DetectronCheckpointer(
         cfg, model, optimizer, scheduler, output_dir, save_to_disk, custom_scheduler=True
     )
@@ -137,26 +200,12 @@ def train(cfg, local_rank, distributed, logger):
         listener, optimizer=listener_optimizer, save_dir=listener_dir, save_to_disk=save_to_disk, custom_scheduler=False
     )
 
+    speaker_listener.add_listener_checkpointer(listener_checkpointer)
+    speaker_listener.add_speaker_checkpointer(checkpointer)
     
-    if checkpointer.has_checkpoint():
-        extra_checkpoint_data = checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
-                                       update_schedule=cfg.SOLVER.UPDATE_SCHEDULE_DURING_LOAD)
-        arguments.update(extra_checkpoint_data)
-    else:
-        # load_mapping is only used when we init current model from detection model.
-        checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, with_optim=False, load_mapping=load_mapping)
-        
-    # if there is certain checkpoint in output_dir, load it, else load pretrained detector
-    if listener_checkpointer.has_checkpoint():
-        extra_listener_checkpoint_data = listener_checkpointer.load()
-        amp.load_state_dict(extra_listener_checkpoint_data['amp'])
-        '''
-        print('Weights after load: ')
-        print('****************************')
-        print(listener.gnn.conv1.node_model.node_mlp_1[0].weight)
-        print('****************************')
-        '''
-        # arguments.update(extra_listener_checkpoint_data)
+    speaker_listener.load_listener()
+    speaker_listener.load_speaker(load_mapping=load_mapping)
+    
     debug_print(logger, 'end load checkpointer')
     train_data_loader = make_data_loader(
         cfg,
@@ -222,33 +271,8 @@ def train(cfg, local_rank, distributed, logger):
                 fix_eval_modules(eval_modules)
                 images_list = deepcopy(images)
                 images_list = to_image_list(images_list, cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
-               
-                #SAVE IMAGE TO PC
-
+            
                 
-                
-                '''
-                transform = transforms.Compose([
-                    transforms.ToPILImage(),
-                    #transforms.Resize((cfg.LISTENER.IMAGE_SIZE, cfg.LISTENER.IMAGE_SIZE)),
-                    transforms.ToTensor(),
-                ])
-                '''
-                # turn images to a uniform size
-                #print('IMAGE BEFORE Transform: ', images[0], 'GPU: ', get_rank())
-                '''
-
-                if is_main_process():
-                    if not is_printed:
-                        transform = transforms.ToPILImage()
-                        print('SAVING IMAGE')
-                        img = transform(images[0].cpu())
-                        print('DONE TRANSFORM')
-                        img.save('image.png')
-                        print('DONE SAVING IMAGE')
-                        print('ids ', image_ids[0])
-
-                '''        
 
                 for i in range(len(images)):
                     images[i] = images[i].unsqueeze(0)
@@ -260,50 +284,13 @@ def train(cfg, local_rank, distributed, logger):
 
                 targets = [target.to(device) for target in targets]
 
-                #print('IMAGE BEFORE Model: ', images[0], 'GPU: ', get_rank())
-                _, sgs = model(images_list, targets)
-                #print('IMAGE AFTER Model: ', images)
-                '''
-                is_printed = False
-                if is_main_process():
-                    if not is_printed:
-                        print('PRINTING OBJECTS')
-                        (obj, rel_pair, rel) = sgs[0]
-                        obj = torch.argmax(obj, dim=1)
-                        for i in range(obj.size(0)):
-                            print(f'OBJECT {i}: ', obj[i])
-                        print('DONE PRINTING OBJECTS')
-                        is_printed=True
-
-                '''
-                image_list = None
-                sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
-                
-                ''' 
-
-                if is_main_process():
-                    if not is_printed:
-                        mistake_saver.add_mistake((image_ids[0], image_ids[1]), (sgs[0], sgs[1]), 231231, 'SG') 
-                        mistake_saver.toHtml('/www')
-                        is_printed = True
-                
-                ''' 
+                score_matrix = speaker_listener(images_list, targets, images)
 
                 listener_loss = 0
                 gap_reward = 0
                 avg_acc = 0
                 num_correct = 0
-                score_matrix = torch.zeros( (images.size(0), images.size(0)) )
-                # fill score matrix
-                for true_index, sg in enumerate(sgs):
-                    acc = 0
-                    detached_sg = (sg[0].detach().requires_grad_().to(torch.float32), sg[1].long(), sg[2].detach().requires_grad_().to(torch.float32))
-                    #scores = listener(sg, images)
-                    with amp.disable_casts():
-                        scores = listener(detached_sg, images)
-                    score_matrix[true_index] = scores
-
-                #print('Score matrix:', score_matrix)
+                
                 score_matrix = score_matrix.to(device)
                 # fill loss matrix
                 loss_matrix = torch.zeros( (2, images.size(0), images.size(0)), device=device)
@@ -351,7 +338,6 @@ def train(cfg, local_rank, distributed, logger):
                     temp_img_acc = temp_img_acc*100/(loss_matrix.size(1)-1)
                     sg_acc += temp_sg_acc
                     img_acc += temp_img_acc
-                
                 if cfg.LISTENER.HTML:
                     if is_main_process() and listener_iteration % 100 == 0 and listener_iteration >= 600:    
                         mistake_saver.toHtml('/www')
@@ -410,11 +396,15 @@ def train(cfg, local_rank, distributed, logger):
                 losses_reduced = sum(loss for loss in loss_dict_reduced.values())
                 meters.update(loss=losses_reduced, **loss_dict_reduced)
 
+
+            
+
+                
                 # Note: If mixed precision is not used, this ends up doing nothing
                 # Otherwise apply loss scaling for mixed-precision recipe
-                losses.backward()
-                #with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
-                #    scaled_losses.backward()
+                #losses.backward()
+                with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
+                    scaled_losses.backward()
                 
 
 
@@ -457,6 +447,8 @@ def train(cfg, local_rank, distributed, logger):
                     print('****************************')
                     """
                     listener_checkpointer.save("model_{:07d}".format(listener_iteration), amp=amp.state_dict())
+                    speaker_listener.load_listener()
+
                     #listener_checkpointer.save("model_{:07d}".format(listener_iteration))
 
                 if iteration == max_iter:
@@ -478,7 +470,7 @@ def train(cfg, local_rank, distributed, logger):
                             "Validation IMG Loss": img_loss,
                         })
                         
-                    logger.info("Validation Result: %.4f" % val_result)
+                    #logger.info("Validation Result: %.4f" % val_result)
         except Exception as err:
             raise(err)
             print('Dataset finished, creating new')
