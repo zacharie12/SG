@@ -30,7 +30,7 @@ import maskrcnn_benchmark.listener
 import maskrcnn_benchmark.structures.image_list
 from maskrcnn_benchmark.config import cfg
 from maskrcnn_benchmark.data import make_data_loader
-from maskrcnn_benchmark.engine.inference import listener_inference
+from maskrcnn_benchmark.engine.inference import listener_inference, inference
 from maskrcnn_benchmark.engine.trainer import reduce_loss_dict
 from maskrcnn_benchmark.listener.listener import build_listener
 from maskrcnn_benchmark.listener.utils import collate_sgs, format_scores, format_scores_reg, MistakeSaver, load_vg_info
@@ -64,12 +64,8 @@ class SpeakerListener(torch.nn.Module):
         self.is_joint = is_joint
 
     def forward(self, speaker_images, targets, listener_images):
-        # *********************************************************************************
-        # TODO: NEED TO CHECK WHAT IS THIS FIRST ARGUMENT                                 *
-        # *********************************************************************************
         speaker_loss, sgs = self.speaker(speaker_images, targets)
         sgs = collate_sgs(sgs, cfg.MODEL.DEVICE)
-        print('speaker loss:', speaker_loss)
 
         score_matrix = torch.zeros( (listener_images.size(0), listener_images.size(0)) ).to(listener_images.get_device())
         for true_index, sg in enumerate(sgs):
@@ -121,7 +117,7 @@ def train(cfg, local_rank, distributed, logger):
     model = build_detection_model(cfg)
     listener = build_listener(cfg)
 
-    speaker_listener = SpeakerListener(model, listener, cfg, is_joint=False)
+    speaker_listener = SpeakerListener(model, listener, cfg, is_joint=cfg.LISTENER.JOINT)
     if is_main_process():
         wandb.watch(listener)
         
@@ -192,7 +188,7 @@ def train(cfg, local_rank, distributed, logger):
     listener_dir = cfg.LISTENER_DIR 
     save_to_disk = get_rank() == 0
 
-    checkpointer = DetectronCheckpointer(
+    speaker_checkpointer = DetectronCheckpointer(
         cfg, model, optimizer, scheduler, output_dir, save_to_disk, custom_scheduler=True
     )
 
@@ -201,7 +197,7 @@ def train(cfg, local_rank, distributed, logger):
     )
 
     speaker_listener.add_listener_checkpointer(listener_checkpointer)
-    speaker_listener.add_speaker_checkpointer(checkpointer)
+    speaker_listener.add_speaker_checkpointer(speaker_checkpointer)
     
     speaker_listener.load_listener()
     speaker_listener.load_speaker(load_mapping=load_mapping)
@@ -226,8 +222,8 @@ def train(cfg, local_rank, distributed, logger):
 
     if cfg.SOLVER.PRE_VAL:
         logger.info("Validate before training")
-        #output =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
-        #print('OUTPUT: ', output)
+        output =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+        print('OUTPUT: ', output)
         #(sg_loss, img_loss, sg_acc, img_acc) = output
 
     logger.info("Start training")
@@ -284,7 +280,22 @@ def train(cfg, local_rank, distributed, logger):
 
                 targets = [target.to(device) for target in targets]
 
-                score_matrix = speaker_listener(images_list, targets, images)
+
+                speaker_loss_dict = {}
+                if not cfg.LISTENER.JOINT:
+                    score_matrix = speaker_listener(images_list, targets, images)
+                else:
+                    score_matrix, _, speaker_loss_dict = speaker_listener(images_list, targets, images)
+                
+                speaker_summed_losses = sum(loss for loss in speaker_loss_dict.values())
+
+                # reduce losses over all GPUs for logging purposes
+                speaker_loss_dict_reduced = reduce_loss_dict(speaker_loss_dict)
+                speaker_losses_reduced = sum(loss for loss in speaker_loss_dict_reduced.values())
+                speaker_losses_reduced /= num_gpus
+
+                if is_main_process():
+                    wandb.log({"Train Speaker Loss": speaker_losses_reduced}, listener_iteration)
 
                 listener_loss = 0
                 gap_reward = 0
@@ -397,12 +408,11 @@ def train(cfg, local_rank, distributed, logger):
                 meters.update(loss=losses_reduced, **loss_dict_reduced)
 
 
-            
-
-                
+                losses = losses + speaker_summed_losses * cfg.LISTENER.LOSS_COEF
                 # Note: If mixed precision is not used, this ends up doing nothing
                 # Otherwise apply loss scaling for mixed-precision recipe
                 #losses.backward()
+
                 with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
                     scaled_losses.backward()
                 
@@ -447,12 +457,12 @@ def train(cfg, local_rank, distributed, logger):
                     print('****************************')
                     """
                     listener_checkpointer.save("model_{:07d}".format(listener_iteration), amp=amp.state_dict())
-                    speaker_listener.load_listener()
-
+                    speaker_checkpointer.save("model_{:07d}".format(iteration))
                     #listener_checkpointer.save("model_{:07d}".format(listener_iteration))
 
                 if iteration == max_iter:
                     listener_checkpointer.save("model_final", amp=amp.state_dict())
+                    speaker_checkpointer.save("model_{:07d}".format(iteration), **arguments)
                     #listener_checkpointer.save("model_final")
 
 
@@ -460,7 +470,7 @@ def train(cfg, local_rank, distributed, logger):
                 if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
                     logger.info("Start validating")
                     val_result = run_val(cfg, model, listener, val_data_loaders, distributed, logger)
-                    (sg_loss, img_loss, sg_acc, img_acc) = val_result
+                    (sg_loss, img_loss, sg_acc, img_acc, speaker_val) = val_result
                     
                     if is_main_process():
                         wandb.log({
@@ -468,7 +478,9 @@ def train(cfg, local_rank, distributed, logger):
                             "Validation IMG Accuracy": img_acc,
                             "Validation SG Loss": sg_loss,
                             "Validation IMG Loss": img_loss,
+                            "Validation Speaker" : speaker_val,
                         })
+                    
                         
                     #logger.info("Validation Result: %.4f" % val_result)
         except Exception as err:
@@ -515,7 +527,7 @@ def run_val(cfg, model, listener, val_data_loaders, distributed, logger):
     val_result = []
     for dataset_name, val_data_loader in zip(dataset_names, val_data_loaders):
         
-        dataset_result = listener_inference(
+        listener_dataset_result = listener_inference(
                             cfg,
                             model,
                             listener,
@@ -529,9 +541,25 @@ def run_val(cfg, model, listener, val_data_loaders, distributed, logger):
                             output_folder=None,
                             logger=logger,
                         )
+        speaker_dataset_result = inference(
+                            cfg,
+                            model,
+                            val_data_loader,
+                            dataset_name=dataset_name,
+                            iou_types=iou_types,
+                            box_only=False if cfg.MODEL.RETINANET_ON else cfg.MODEL.RPN_ONLY,
+                            device=cfg.MODEL.DEVICE,
+                            expected_results=cfg.TEST.EXPECTED_RESULTS,
+                            expected_results_sigma_tol=cfg.TEST.EXPECTED_RESULTS_SIGMA_TOL,
+                            output_folder=None,
+                            logger=logger,
+                        )
         synchronize()
-        if type(dataset_result) is not tuple:
-            dataset_result = (dataset_result,)
+        if type(listener_dataset_result) is not tuple:
+            listener_dataset_result = (listener_dataset_result,)
+        if type(speaker_dataset_result) is not tuple:
+            speaker_dataset_result = (speaker_dataset_result,)
+        dataset_result = (listener_dataset_result + speaker_dataset_result)
         val_result.append(dataset_result)
 
     organized_result = [[val_result[i][j] for i in range(len(val_result))] for j in range(len(val_result[0]))]

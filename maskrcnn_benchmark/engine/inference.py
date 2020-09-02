@@ -29,22 +29,28 @@ def compute_on_dataset(model, data_loader, device, synchronize_gather=True, time
     torch.cuda.empty_cache()
     for _, batch in enumerate(tqdm(data_loader)):
         with torch.no_grad():
-            images, targets, image_ids = batch
+            images_list, targets, image_ids = batch
+            #images = to_image_list(images)
             targets = [target.to(device) for target in targets]
             if timer:
                 timer.tic()
             if cfg.TEST.BBOX_AUG.ENABLED:
                 output = im_detect_bbox_aug(model, images, device)
             else:
+                output=[]
+                for i in range(len(images_list)):
+                    model_input = to_image_list(images_list[i], cfg.DATALOADER.SIZE_DIVISIBILITY).to(device)
+                    out = model.forward(model_input, [targets[i]], ret_sg=False)
+                    output.append(out)
                 # relation detection needs the targets
-                output = model(images.to(device), targets)
-                print('SG output: ', output[0].extra_fields)
+                #output = model(images.to(device), targets)
+                #print('SG output: ', output[0].extra_fields)
 
             if timer:
                 if not cfg.MODEL.DEVICE == 'cpu':
                     torch.cuda.synchronize()
                 timer.toc()
-            output = [o.to(cpu_device) for o in output]
+            output = [o[0].to(cpu_device) for o in output]
         if synchronize_gather:
             synchronize()
             multi_gpu_predictions = all_gather({img_id: result for img_id, result in zip(image_ids, output)})

@@ -468,7 +468,7 @@ def train(cfg, local_rank, distributed, logger):
                 if cfg.SOLVER.TO_VAL and iteration % cfg.SOLVER.VAL_PERIOD == 0:
                     logger.info("Start validating")
                     val_result = run_val(cfg, model, listener, val_data_loaders, distributed, logger)
-                    (sg_loss, img_loss, sg_acc, img_acc) = val_result
+                    (sg_loss, img_loss, sg_acc, img_acc, speaker_val) = val_result
                     
                     if is_main_process():
                         wandb.log({
@@ -476,9 +476,9 @@ def train(cfg, local_rank, distributed, logger):
                             "Validation IMG Accuracy": img_acc,
                             "Validation SG Loss": sg_loss,
                             "Validation IMG Loss": img_loss,
+                            "Speaker Val" : speaker_val,
                         })
                         
-                    logger.info("Validation Result: %.4f" % val_result)
         except Exception as err:
             raise(err)
             print('Dataset finished, creating new')
