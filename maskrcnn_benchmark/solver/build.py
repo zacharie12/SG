@@ -127,6 +127,17 @@ def make_listener_optimizer(cfg, model):
     #optimizer = torch.optim.SGD(params=params, lr=cfg.LISTENER.LR, momentum=0.9)
     return optimizer
 
+def make_speaker_listener_optimizer(cfg, speaker, listener):
+    params = []
+    for key, value in speaker.named_parameters():
+        params += [{'params': [value]}]
+    for key, value in listener.named_parameters():
+        params += [{'params': [value]}]        
+    optimizer = torch.optim.Adam(params, lr=cfg.LISTENER.LR, weight_decay=cfg.LISTENER.WEIGHT_DECAY)
+    #optimizer = LARS(params, lr=cfg.LISTENER.LR)
+    #optimizer = torch.optim.SGD(params=params, lr=cfg.LISTENER.LR, momentum=0.9)
+    return optimizer
+
 def make_lr_scheduler(cfg, optimizer, logger=None):
     if cfg.SOLVER.SCHEDULE.TYPE == "WarmupMultiStepLR":
         return WarmupMultiStepLR(

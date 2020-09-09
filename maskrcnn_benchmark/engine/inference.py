@@ -21,8 +21,44 @@ import torchvision
 from torchvision import transforms
 import torch.nn.functional as F
 
-
 def compute_on_dataset(model, data_loader, device, synchronize_gather=True, timer=None):
+    model.eval()
+    results_dict = {}
+    cpu_device = torch.device("cpu")
+    torch.cuda.empty_cache()
+    for _, batch in enumerate(tqdm(data_loader)):
+        with torch.no_grad():
+            images, targets, image_ids = batch
+            targets = [target.to(device) for target in targets]
+            if timer:
+                timer.tic()
+            if cfg.TEST.BBOX_AUG.ENABLED:
+                output = im_detect_bbox_aug(model, images, device)
+            else:
+                # relation detection needs the targets
+                output = model(images.to(device), targets)
+            if timer:
+                if not cfg.MODEL.DEVICE == 'cpu':
+                    torch.cuda.synchronize()
+                timer.toc()
+            output = [o.to(cpu_device) for o in output]
+        if synchronize_gather:
+            synchronize()
+            multi_gpu_predictions = all_gather({img_id: result for img_id, result in zip(image_ids, output)})
+            if is_main_process():
+                for p in multi_gpu_predictions:
+                    results_dict.update(p)
+        else:
+            results_dict.update(
+                {img_id: result for img_id, result in zip(image_ids, output)}
+            )
+    torch.cuda.empty_cache()
+    return results_dict
+
+#*************************************************************************************
+# Was change don't rember why I change the name that way we can do test!!!!!!!!!!!!!
+#*************************************************************************************
+def compute_on_dataset_change(model, data_loader, device, synchronize_gather=True, timer=None):
     model.eval()
     results_dict = {}
     cpu_device = torch.device("cpu")

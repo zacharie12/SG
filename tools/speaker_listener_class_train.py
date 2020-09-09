@@ -36,7 +36,7 @@ from maskrcnn_benchmark.listener.listener import build_listener
 from maskrcnn_benchmark.listener.utils import collate_sgs, format_scores, format_scores_reg, MistakeSaver, load_vg_info
 from maskrcnn_benchmark.modeling.detector import build_detection_model
 from maskrcnn_benchmark.solver import (make_listener_optimizer,
-                                       make_lr_scheduler, make_optimizer)
+                                       make_lr_scheduler, make_optimizer, make_speaker_listener_optimizer)
 from maskrcnn_benchmark.structures.image_list import to_image_list
 from maskrcnn_benchmark.utils.checkpoint import (Checkpointer,
                                                  DetectronCheckpointer,
@@ -104,11 +104,11 @@ class SpeakerListener(torch.nn.Module):
     def load_speaker(self, load_mapping=None):
         if self.speaker_checkpointer.has_checkpoint():
             extra_checkpoint_data = self.speaker_checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, 
-                                        update_schedule=cfg.SOLVER.UPDATE_SCHEDULE_DURING_LOAD)
+                                        update_schedule=cfg.SOLVER.UPDATE_SCHEDULE_DURING_LOAD)                         
         else:
             # load_mapping is only used when we init current model from detection model.
             self.speaker_checkpointer.load(cfg.MODEL.PRETRAINED_DETECTOR_CKPT, with_optim=False, load_mapping=load_mapping)
-        
+
 def train(cfg, local_rank, distributed, logger):
     if is_main_process():
         wandb.init(project='scene-graph', entity='sgg-speaker-listener', config=cfg.LISTENER)
@@ -151,16 +151,27 @@ def train(cfg, local_rank, distributed, logger):
 
     num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
     num_batch = cfg.SOLVER.IMS_PER_BATCH
+    
+    
     optimizer = make_optimizer(cfg, model, logger, slow_heads=slow_heads, slow_ratio=10.0, rl_factor=float(num_batch))
     listener_optimizer = make_listener_optimizer(cfg, listener)
     scheduler = make_lr_scheduler(cfg, optimizer, logger)
     listener_scheduler = None
-    debug_print(logger, 'end optimizer and shcedule')
+    debug_print(logger, 'end optimizer and schedule')
+
+    if cfg.LISTENER.JOINT:
+        speaker_listener_optimizer = make_speaker_listener_optimizer(cfg, speaker_listener.speaker, speaker_listener.listener)   
+
     # Initialize mixed-precision training
     use_mixed_precision = cfg.DTYPE == "float16"
     amp_opt_level = 'O1' if use_mixed_precision else 'O0'
 
-    speaker_listener, listener_optimizer = amp.initialize(speaker_listener, listener_optimizer, opt_level='O0')
+   
+    if cfg.LISTENER.JOINT:
+        speaker_listener, speaker_listener_optimizer = amp.initialize(speaker_listener, speaker_listener_optimizer, opt_level='O0')
+    else:
+        speaker_listener, listener_optimizer = amp.initialize(speaker_listener, listener_optimizer, opt_level='O0')
+
     #listener, listener_optimizer = amp.initialize(listener, listener_optimizer, opt_level='O0')
     #[model, listener], [optimizer, listener_optimizer] = amp.initialize([model, listener], [optimizer, listener_optimizer], opt_level='O1', loss_scale=1)
     #model = amp.initialize(model, opt_level='O1')
@@ -201,7 +212,6 @@ def train(cfg, local_rank, distributed, logger):
     
     speaker_listener.load_listener()
     speaker_listener.load_speaker(load_mapping=load_mapping)
-    
     debug_print(logger, 'end load checkpointer')
     train_data_loader = make_data_loader(
         cfg,
@@ -222,8 +232,8 @@ def train(cfg, local_rank, distributed, logger):
 
     if cfg.SOLVER.PRE_VAL:
         logger.info("Validate before training")
-        output =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
-        print('OUTPUT: ', output)
+        #output =  run_val(cfg, model, listener, val_data_loaders, distributed, logger)
+        #print('OUTPUT: ', output)
         #(sg_loss, img_loss, sg_acc, img_acc) = output
 
     logger.info("Start training")
@@ -251,7 +261,11 @@ def train(cfg, local_rank, distributed, logger):
         try:
             listener_iteration=0
             for iteration, (images, targets, image_ids) in enumerate(train_data_loader, start_iter):
-                listener_optimizer.zero_grad()
+
+                if cfg.LISTENER.JOINT:
+                    speaker_listener_optimizer.zero_grad()
+                else:    
+                    listener_optimizer.zero_grad()
 
                 #print(f'ITERATION NUMBER: {iteration}')
                 if any(len(target) < 1 for target in targets):
@@ -290,12 +304,13 @@ def train(cfg, local_rank, distributed, logger):
                 speaker_summed_losses = sum(loss for loss in speaker_loss_dict.values())
 
                 # reduce losses over all GPUs for logging purposes
-                speaker_loss_dict_reduced = reduce_loss_dict(speaker_loss_dict)
-                speaker_losses_reduced = sum(loss for loss in speaker_loss_dict_reduced.values())
-                speaker_losses_reduced /= num_gpus
+                if not not cfg.LISTENER.JOINT:
+                    speaker_loss_dict_reduced = reduce_loss_dict(speaker_loss_dict)
+                    speaker_losses_reduced = sum(loss for loss in speaker_loss_dict_reduced.values())
+                    speaker_losses_reduced /= num_gpus
 
-                if is_main_process():
-                    wandb.log({"Train Speaker Loss": speaker_losses_reduced}, listener_iteration)
+                    if is_main_process():
+                        wandb.log({"Train Speaker Loss": speaker_losses_reduced}, listener_iteration)
 
                 listener_loss = 0
                 gap_reward = 0
@@ -412,17 +427,22 @@ def train(cfg, local_rank, distributed, logger):
                 # Note: If mixed precision is not used, this ends up doing nothing
                 # Otherwise apply loss scaling for mixed-precision recipe
                 #losses.backward()
-
-                with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
-                    scaled_losses.backward()
-                
+                if not cfg.LISTENER.JOINT:
+                    with amp.scale_loss(losses, listener_optimizer) as scaled_losses:
+                        scaled_losses.backward()
+                else:
+                    with amp.scale_loss(losses, speaker_listener_optimizer) as scaled_losses:
+                        scaled_losses.backward()
 
 
                 verbose = (iteration % cfg.SOLVER.PRINT_GRAD_FREQ) == 0 or print_first_grad # print grad or not
                 print_first_grad = False
                 #clip_grad_value([(n, p) for n, p in listener.named_parameters() if p.requires_grad], cfg.LISTENER.CLIP_VALUE, logger=logger, verbose=True, clip=True)
-                listener_optimizer.step()
-
+                if not cfg.LISTENER.JOINT:
+                    listener_optimizer.step()
+                else:
+                    speaker_listener_optimizer.step()
+                    
                 batch_time = time.time() - end
                 end = time.time()
                 meters.update(time=batch_time, data=data_time)
@@ -430,24 +450,45 @@ def train(cfg, local_rank, distributed, logger):
                 eta_seconds = meters.time.global_avg * (max_iter - iteration)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
 
-                if iteration % 200 == 0 or iteration == max_iter:
-                    logger.info(
-                        meters.delimiter.join(
-                            [
-                                "eta: {eta}",
-                                "iter: {iter}",
-                                "{meters}",
-                                "lr: {lr:.6f}",
-                                "max mem: {memory:.0f}",
-                            ]
-                        ).format(
-                            eta=eta_string,
-                            iter=iteration,
-                            meters=str(meters),
-                            lr=listener_optimizer.param_groups[-1]["lr"],
-                            memory=torch.cuda.max_memory_allocated() / 1024.0 / 1024.0,
+                if cfg.LISTENER.JOINT:
+                    if iteration % 200 == 0 or iteration == max_iter:
+                        logger.info(
+                            meters.delimiter.join(
+                                [
+                                    "eta: {eta}",
+                                    "iter: {iter}",
+                                    "{meters}",
+                                    "lr: {lr:.6f}",
+                                    "max mem: {memory:.0f}",
+                                ]
+                            ).format(
+                                eta=eta_string,
+                                iter=iteration,
+                                meters=str(meters),
+                                lr=speaker_listener_optimizer.param_groups[-1]["lr"],
+                                memory=torch.cuda.max_memory_allocated() / 1024.0 / 1024.0,
+                            )
                         )
-                    )
+                else: 
+                    if iteration % 200 == 0 or iteration == max_iter:
+                        logger.info(
+                            meters.delimiter.join(
+                                [
+                                    "eta: {eta}",
+                                    "iter: {iter}",
+                                    "{meters}", 
+                                    "lr: {lr:.6f}",
+                                    "max mem: {memory:.0f}",
+                                ]
+                            ).format(
+                                eta=eta_string,
+                                iter=iteration,
+                                meters=str(meters),
+                                lr=listener_optimizer.param_groups[-1]["lr"],
+                                memory=torch.cuda.max_memory_allocated() / 1024.0 / 1024.0,
+                            )
+                        )
+        
 
                 if iteration % checkpoint_period == 0:
                     """
@@ -456,14 +497,17 @@ def train(cfg, local_rank, distributed, logger):
                     print(listener.gnn.conv1.node_model.node_mlp_1[0].weight)
                     print('****************************')
                     """
-                    listener_checkpointer.save("model_{:07d}".format(listener_iteration), amp=amp.state_dict())
-                    speaker_checkpointer.save("model_{:07d}".format(iteration))
-                    #listener_checkpointer.save("model_{:07d}".format(listener_iteration))
-
+                    if not cfg.LISTENER.JOINT:
+                        listener_checkpointer.save("model_{:07d}".format(listener_iteration), amp=amp.state_dict())
+                    else:
+                        speaker_checkpointer.save("model_speaker{:07d}".format(iteration))
+                        listener_checkpointer.save("model_listenr{:07d}".format(listener_iteration), amp=amp.state_dict())
                 if iteration == max_iter:
-                    listener_checkpointer.save("model_final", amp=amp.state_dict())
-                    speaker_checkpointer.save("model_{:07d}".format(iteration), **arguments)
-                    #listener_checkpointer.save("model_final")
+                    if not cfg.LISTENER.JOINT:
+                        listener_checkpointer.save("model_{:07d}".format(listener_iteration), amp=amp.state_dict())
+                    else:
+                        speaker_checkpointer.save("model_{:07d}".format(iteration))
+                        listener_checkpointer.save("model_{:07d}".format(listener_iteration), amp=amp.state_dict())
 
 
                 val_result = None # used for scheduler updating
